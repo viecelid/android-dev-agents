@@ -1,4 +1,4 @@
-# 🤖 Android Dev Agents (based on LangGraph)
+# 🤖 Android Dev Agents
 
 An AI-powered multi-agent system that helps you develop Android apps iteratively through natural language instructions. Built with LangGraph, it orchestrates a team of specialized agents that plan, implement, test, and commit code — all with human-in-the-loop review at every step.
 
@@ -33,131 +33,186 @@ Every step requires your explicit approval. You can provide feedback at any poin
 
 ## 📋 Prerequisites
 
-- Python 3.11+
-- Docker (recommended) or local Python environment
+- macOS (this guide is written for macOS)
+- Docker Desktop for Mac (https://www.docker.com/products/docker-desktop/)
 - GitHub account with a repository for your Android project
+- GitHub CLI (gh) authenticated locally (https://cli.github.com/)
 - API keys:
   - OpenRouter (https://openrouter.ai/) or any OpenAI-compatible API
   - Anthropic (https://console.anthropic.com/) — optional, depending on model choice
   - GitHub Personal Access Token (https://github.com/settings/tokens) with repo + project permissions
 
 
-## 🚀 Setup (Local)
+## 🐳 Setup (Docker on macOS)
 
-1. Clone this repository:
+This project is designed to run inside a Docker container. The container includes Python, the Android SDK, Git, and all dependencies needed to build Android projects and run the agents.
+
+### 1. Install Docker Desktop
+
+Download and install Docker Desktop for Mac from:
+https://www.docker.com/products/docker-desktop/
+
+Make sure Docker Desktop is running (whale icon visible in menu bar).
+
+### 2. Clone the repository
 
    git clone https://github.com/viecelid/android-dev-agents.git
-   cd android-dev-agents
 
-2. Create virtual environment:
+The folder must be called android-dev-agents. If you rename it, you must update
+all paths in the docker commands and the Dockerfile accordingly.
 
-   python -m venv .venv
-   source .venv/bin/activate
+### 3. Build the Docker image
 
-3. Install dependencies:
+Navigate to the PARENT directory of android-dev-agents and build from there:
 
-   pip install -r requirements.txt
+   cd /path/to/parent-folder
+   docker build --platform linux/amd64 -t android-dev-agents -f android-dev-agents/exampleDocker/DockerImageAndroidDevAgents .
 
-4. Configure environment:
+The build context (.) is the parent folder. This is required because the Dockerfile
+references files via the android-dev-agents/ prefix.
 
-   cp .env.example .env
+Note: --platform linux/amd64 is required on Apple Silicon Macs (M1/M2/M3/M4).
+The build may take several minutes on first run (downloading Android SDK, etc.).
 
-   Edit .env with your values (see Configuration section below).
+Example folder structure:
 
-5. Run:
+   parent-folder/              <-- run docker build HERE
+   ├── android-dev-agents/    <-- the cloned repo
+   │   ├── exampleDocker/
+   │   │   └── DockerImageAndroidDevAgents
+   │   ├── requirements.txt
+   │   ├── main.py
+   │   └── ...
+   └── YourAndroidProject/    <-- your Android project (optional, can be anywhere)
+
+### 4. Configure environment (.env.docker)
+
+You need a .env.docker file that contains the environment variables with paths
+as they appear INSIDE the container (not your local macOS paths).
+
+Create or edit .env.docker in the android-dev-agents folder:
+
+   # LLM API Keys
+   ANTHROPIC_API_KEY=sk-ant-...
+   OPENAI_API_KEY=sk-or-...
+   OPENAI_API_BASE=https://openrouter.ai/api/v1
+
+   # GitHub
+   GITHUB_TOKEN=ghp_...
+   GITHUB_REPO=youruser/YourApp
+   GITHUB_PROJECT_NUMBER=1
+   DEFAULT_BASE_BRANCH=main
+
+   # Project (path INSIDE the container — not your macOS path!)
+   REPO_PATH=/app/YourProject
+
+   # Build
+   BUILD_COMMAND=./gradlew assembleDebug
+
+   # Android App
+   APP_PACKAGE=com.example.myapp
+   APP_NAME=MyApp
+   ANDROID_MIN_SDK=31
+   ANDROID_TARGET_SDK=35
+   ANDROID_COMPILE_SDK=36
+
+   # Agent
+   MAX_RETRIES=3
+
+Important: The DEFAULT_BASE_BRANCH must already exist on your GitHub repository.
+For new/empty repos this is typically "main". If you set it to something like
+"developer", make sure that branch exists on GitHub first:
+
+   cd /path/to/your/android/project
+   git checkout -b developer
+   git push origin developer
+
+If the branch doesn't exist, you'll get a "Branch not found: 404" error when
+the agent tries to create feature branches.
+
+Why .env.docker?
+
+Your local .env uses macOS paths like /Users/dario/StudioProjects/MosquitoBuzzV5.
+Inside the container, the project is mounted at /app/YourProject instead.
+The .env.docker file uses container-internal paths so the agents can find your project.
+
+| File         | Used by          | Paths                              |
+|--------------|------------------|------------------------------------|
+| .env         | Local dev        | /Users/you/StudioProjects/...      |
+| .env.docker  | Docker container | /app/... (container mount points)  |
+
+### 5. Run the container
+
+   docker run -it --platform linux/amd64 \
+     -v /path/to/android-dev-agents:/app/android-dev-agents \
+     -v /path/to/your/android/project:/app/YourProject \
+     -v ~/.config/gh:/root/.config/gh:ro \
+     --env-file /path/to/android-dev-agents/.env.docker \
+     -w /app/android-dev-agents \
+     android-dev-agents \
+     bash -c '
+       export GIT_CONFIG_GLOBAL=/tmp/.gitconfig
+       git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+       git config --global user.name "youruser"
+       git config --global user.email "your-email@example.com"
+       exec bash'
+
+Replace the paths:
+- /path/to/android-dev-agents → your local clone of this repo
+- /path/to/your/android/project → your Android project on your Mac
+
+Flags and mounts explained:
+- -it → interactive terminal (required for human review input)
+- --platform linux/amd64 → required for Apple Silicon Macs (M1/M2/M3/M4)
+- -v .../android-dev-agents:/app/android-dev-agents → mounts the agent repo (live code changes)
+- -v .../YourProject:/app/YourProject → mounts your Android project
+- -v ~/.config/gh:/root/.config/gh:ro → shares GitHub CLI auth (read-only)
+- --env-file .env.docker → injects environment variables with container paths
+- -w /app/android-dev-agents → sets working directory inside container
+- bash -c '...' → configures git credentials using the GITHUB_TOKEN from .env.docker
+
+After the container starts, you are in a bash shell. Start the agents with:
 
    python main.py
 
+### 6. Restart after stopping
 
-## 🐳 Setup (Docker) — Recommended
+If the container was stopped but still exists:
 
-Running in Docker provides a clean, isolated environment and avoids dependency conflicts.
+   docker start -i <container-name>
 
-### Dockerfile
+If you want a fresh start (removes container):
 
-Create a Dockerfile in the project root:
+   docker rm <container-name>
 
-   FROM python:3.12-slim
+Then run the docker run command from step 5 again.
 
-   WORKDIR /app/android-dev-agents
+### Security best practices
 
-   RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
-   COPY requirements.txt .
-   RUN pip install --no-cache-dir -r requirements.txt
-
-   COPY . .
-
-   CMD ["python", "main.py"]
-
-### Build the image
-
-   docker build -t android-dev-agents .
-
-### Run interactively
-
-   docker run -it \
-     --name dev-agents \
-     -v /path/to/your/android/project:/app/YourProject \
-     -v $(pwd)/.env:/app/android-dev-agents/.env:ro \
-     -v $(pwd)/checkpoints:/app/android-dev-agents/checkpoints \
-     android-dev-agents
-
-Flags explained:
-- -it → interactive terminal (required for human review)
-- -v .../project:/app/YourProject → mount your Android project
-- -v .env:.../.env:ro → mount env file read-only (security)
-- -v .../checkpoints:... → persist checkpoints between restarts
-
-### Docker Compose (alternative)
-
-Create docker-compose.yml:
-
-   version: '3.8'
-   services:
-     dev-agents:
-       build: .
-       stdin_open: true
-       tty: true
-       volumes:
-         - /path/to/your/android/project:/app/YourProject
-         - ./.env:/app/android-dev-agents/.env:ro
-         - ./checkpoints:/app/android-dev-agents/checkpoints
-         - ./logs:/app/android-dev-agents/logs
-         - ./documentation:/app/android-dev-agents/documentation
-
-Run with:
-
-   docker compose run dev-agents
-
-### Security best practices for Docker
-
-- Never bake API keys into the image — always mount .env at runtime
-- Use :ro (read-only) for the .env mount
+- Never bake API keys into the Docker image — always inject via --env-file at runtime
+- Use :ro (read-only) for sensitive mounts like GitHub CLI config
 - Don't push the image to public registries
 - Mount the Android project rather than copying it into the image
-- Persist checkpoints via volume mount so you can resume after container restarts
+- Rotate API keys if they were ever accidentally committed to Git
 
 
 ## 🎮 Usage
 
 ### Start the agent system
 
+Once inside the container, start the agents:
+
    python main.py
 
-### First run (existing project)
+On first run with an existing project:
+1. The system loads and analyzes your project
+2. Shows you a summary (structure, features, tech stack)
+3. Waits for your first instruction
 
-The system will:
-1. Load and analyze your project
-2. Show you a summary (structure, features, tech stack)
-3. Wait for your first instruction
-
-### First run (empty project)
-
-The system will:
-1. Detect that no project exists
-2. Offer to scaffold a new Android project (Kotlin, Jetpack Compose, Material 3)
-3. After scaffolding, wait for your instructions
+On first run with an empty project:
+1. The system detects that no project exists
+2. Offers to scaffold a new Android project (Kotlin, Jetpack Compose, Material 3)
+3. After scaffolding, waits for your instructions
 
 ### Giving instructions
 
@@ -184,7 +239,7 @@ Or give feedback:
 
 ### Resume after pause
 
-Simply run python main.py again. The system detects the checkpoint and asks if you want to continue.
+Simply start the container again and run python main.py. The system detects the checkpoint and asks if you want to continue.
 
 
 ## 📁 Project Structure
@@ -206,6 +261,7 @@ Simply run python main.py again. The system detects the checkpoint and asks if y
    │   ├── planner_prompt.md    # System prompt for Planner
    │   ├── developer_prompt.md  # System prompt for Developer
    │   └── tester_prompt.md     # System prompt for Tester
+   ├── exampleDocker/           # Dockerfile for building the container
    ├── checkpoints/             # SQLite checkpoints (auto-generated)
    ├── logs/                    # Build logs (auto-generated)
    └── documentation/           # Auto-generated dev docs
@@ -213,7 +269,7 @@ Simply run python main.py again. The system detects the checkpoint and asks if y
 
 ## ⚙️ Configuration
 
-All configuration is done via environment variables (.env file).
+All configuration is done via environment variables (.env.docker file for Docker usage).
 
 | Variable              | Description                | Example                          |
 |-----------------------|----------------------------|----------------------------------|

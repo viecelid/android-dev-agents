@@ -1,6 +1,8 @@
 # main.py
 
 import os
+import time
+from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
@@ -219,6 +221,10 @@ def _try_resume(config: dict) -> bool:
         )
         phase = values.get("phase", "")
 
+        # ── "done" oder leer = fertig → direkt zur development_loop ──
+        if phase == "done" or phase == "":
+            return False
+
         # ── Checkpoint vorhanden → Fortsetzen? ──
         if phase and phase != "await_instruction":
             task = values.get("current_task")
@@ -269,11 +275,13 @@ def _try_resume(config: dict) -> bool:
 def development_loop(config: dict, project_data: dict):
     """
     Hauptschleife: Wartet auf Human-Anweisungen, startet den Graph pro Task.
+    Jede Anweisung bekommt eine eigene Thread-ID um Checkpoint-Konflikte zu vermeiden.
     """
 
     # ── Initiale Projekt-Analyse (nur bei bestehendem Projekt) ──
     if project_data["project_initialized"]:
-        _run_initial_analysis(project_data)
+        if Confirm.ask("🔍 Projekt-Analyse anzeigen?", default=True):
+            _run_initial_analysis(project_data)
 
     # ── Interaktive Loop starten ──
     console.print(Panel(
@@ -288,6 +296,7 @@ def development_loop(config: dict, project_data: dict):
     ))
 
     completed_tasks = []
+    task_counter = 0
 
     while True:
         # ── Auf Anweisung warten ──
@@ -310,6 +319,13 @@ def development_loop(config: dict, project_data: dict):
                 _print_completed_tasks(completed_tasks)
             continue
 
+        # ── Neuer Thread pro Anweisung (verhindert Checkpoint-Konflikt) ──
+        task_counter += 1
+        task_config = {
+            "configurable": {"thread_id": f"{THREAD_ID}-task-{task_counter}"},
+            "recursion_limit": 100,
+        }
+
         # ── Graph mit Anweisung starten ──
         console.print(
             f"\n[bold green]🤖 Starte Planung für:[/bold green] {instruction}\n"
@@ -325,14 +341,14 @@ def development_loop(config: dict, project_data: dict):
         )
 
         try:
-            for event in app.stream(initial_state, config, stream_mode="values"):
+            for event in app.stream(initial_state, task_config, stream_mode="values"):
                 _print_phase(event)
 
             # ── Nach Task: Projekt neu einlesen ──
             project_data = load_project()
             # Erledigte Tasks aus State holen
             try:
-                state = app.get_state(config)
+                state = app.get_state(task_config)
                 values = (
                     state.values
                     if hasattr(state, "values")
@@ -392,6 +408,12 @@ def run():
         ))
 
         if Confirm.ask("🏗️  Neues Projekt scaffolden?"):
+            # Eigener Thread für Scaffold
+            scaffold_config = {
+                "configurable": {"thread_id": f"{THREAD_ID}-scaffold"},
+                "recursion_limit": 100,
+            }
+
             # Graph mit Scaffold-Anweisung starten
             initial_state = AgentState(
                 messages=[],
@@ -414,7 +436,7 @@ def run():
             console.print("\n[bold green]🤖 Scaffold wird erstellt...[/bold green]\n")
 
             try:
-                for event in app.stream(initial_state, config, stream_mode="values"):
+                for event in app.stream(initial_state, scaffold_config, stream_mode="values"):
                     _print_phase(event)
             except KeyboardInterrupt:
                 _handle_interrupt()
