@@ -253,18 +253,30 @@ def add_issue_comment(issue_number: int, body: str):
 # ============================================================
 
 def create_feature_branch(feature_name: str) -> str:
-    """Erstellt feature/<name> Branch vom Base Branch."""
+    """Erstellt feature/<name> Branch vom Base Branch (remote + lokal auschecken)."""
     base = repo.get_branch(settings.default_base_branch)
     ref_name = f"refs/heads/feature/{feature_name}"
+    branch_name = f"feature/{feature_name}"
+
     try:
         repo.create_git_ref(ref=ref_name, sha=base.commit.sha)
-        print(f"  🌿 Branch erstellt: feature/{feature_name}")
+        print(f"  🌿 Branch erstellt: {branch_name}")
     except Exception as e:
         if "already exists" in str(e):
-            print(f"  🌿 Branch existiert bereits: feature/{feature_name}")
+            print(f"  🌿 Branch existiert bereits: {branch_name}")
         else:
             raise
-    return f"feature/{feature_name}"
+
+    # ── Lokal auschecken (damit Developer auf dem richtigen Branch schreibt) ──
+    git_local("fetch origin")
+    current = git_local("branch --show-current").strip()
+    if current != branch_name:
+        output = git_local(f"checkout {branch_name}")
+        if "error" in output.lower():
+            git_local(f"checkout -b {branch_name} origin/{branch_name}")
+        print(f"  🌿 Lokal auf Branch: {branch_name}")
+
+    return branch_name
 
 
 # ============================================================
@@ -295,6 +307,9 @@ def create_pull_request(
         if "No commits between" in str(e):
             print(f"  ⚠️ Keine Commits zwischen {settings.default_base_branch} und {branch} – PR übersprungen")
             return "n/a (keine Änderungen)"
+        elif "A pull request already exists" in str(e):
+            print(f"  ⚠️ PR existiert bereits für {branch}")
+            return "n/a (PR existiert bereits)"
         else:
             raise
 
@@ -315,6 +330,11 @@ def git_local(command: str) -> str:
     return result.stdout + result.stderr
 
 
+def get_current_branch() -> str:
+    """Gibt den aktuellen lokalen Branch zurück."""
+    return git_local("branch --show-current").strip()
+
+
 def checkout_branch(branch_name: str) -> str:
     """Wechselt lokal auf einen Branch (fetch + checkout)."""
     git_local("fetch origin")
@@ -325,25 +345,88 @@ def checkout_branch(branch_name: str) -> str:
     return output
 
 
-def commit_and_push(files: list[str], message: str, branch_name: str) -> str:
-    """Staged, committed und pusht Dateien auf den Feature-Branch."""
-    checkout_branch(branch_name)
+def ensure_on_branch(branch_name: str) -> str:
+    """
+    Stellt sicher dass wir auf dem richtigen Branch sind.
+    OHNE fetch – damit lokale Änderungen nicht verloren gehen.
+    """
+    current = get_current_branch()
+    if current == branch_name:
+        return f"Bereits auf {branch_name}"
 
-    # Stage alle Änderungen (sicherer als einzelne Dateien mit Pfad-Problemen)
+    # Nur lokaler checkout (kein fetch, keine Remote-Überschreibung)
+    output = git_local(f"checkout {branch_name}")
+    if "error" in output.lower():
+        # Branch existiert lokal noch nicht → von remote holen
+        git_local("fetch origin")
+        output = git_local(f"checkout -b {branch_name} origin/{branch_name}")
+    print(f"  🌿 Auf Branch: {branch_name}")
+    return output
+
+
+def commit_and_push(files: list[str], message: str, branch_name: str) -> str:
+    """
+    Staged, committed und pusht Dateien auf den Feature-Branch.
+    WICHTIG: Macht KEINEN destructiven checkout – lokale Änderungen bleiben erhalten.
+    """
+
+    # ── Sicherstellen dass wir auf dem richtigen Branch sind (ohne fetch!) ──
+    ensure_on_branch(branch_name)
+
+    # ── Stage alle Änderungen ──
     git_local("add -A")
 
-    # Prüfe ob es etwas zu committen gibt
+    # ── Prüfe ob es etwas zu committen gibt ──
     status = git_local("status --porcelain")
     if not status.strip():
         print(f"  ⚠️ Keine Änderungen zu committen auf {branch_name}")
+
+        # Debug: Zeige was auf dem Branch ist vs. remote
+        diff_info = git_local(f"log origin/{settings.default_base_branch}..HEAD --oneline")
+        if diff_info.strip():
+            print(f"  ℹ️ Lokale Commits vorhanden (noch nicht gepusht?):")
+            for line in diff_info.strip().split("\n")[:5]:
+                print(f"     {line}")
+            # Push versuchen falls lokale Commits vorhanden
+            push_output = git_local(f"push origin {branch_name}")
+            if "Everything up-to-date" not in push_output:
+                print(f"  📦 Nachträglicher Push erfolgreich")
+                return push_output
         return "nothing to commit"
 
-    result = git_local(f'commit -m "{message}"')
+    # ── Commit ──
+    commit_output = git_local(f'commit -m "{message}"')
+    if "nothing to commit" in commit_output:
+        print(f"  ⚠️ Git sagt: nothing to commit")
+        return "nothing to commit"
     print(f"  📝 Commit: {message}")
 
-    output = git_local(f"push origin {branch_name}")
+    # ── Push ──
+    push_output = git_local(f"push origin {branch_name}")
     print(f"  📦 Push: {message} ({len(files)} Dateien)")
-    return output
+
+    # ── Push validieren ──
+    if "Everything up-to-date" in push_output:
+        print(f"  ⚠️ Push: Everything up-to-date – versuche force push")
+        push_output = git_local(f"push origin {branch_name} --force")
+
+    if "rejected" in push_output.lower():
+        print(f"  ⚠️ Push rejected – versuche force push")
+        push_output = git_local(f"push origin {branch_name} --force")
+
+    if "error" in push_output.lower() and "force" not in push_output.lower():
+        print(f"  ❌ Push Fehler: {push_output[-300:]}")
+
+    # ── Verifiziere: Diff zum Base Branch vorhanden? ──
+    git_local("fetch origin")
+    diff_check = git_local(f"log origin/{settings.default_base_branch}..origin/{branch_name} --oneline")
+    if not diff_check.strip():
+        print(f"  ⚠️ WARNUNG: Kein Diff auf Remote zwischen {settings.default_base_branch} und {branch_name}")
+        return "nothing to commit"
+
+    commit_count = len(diff_check.strip().split("\n"))
+    print(f"  ✅ {commit_count} Commit(s) auf Remote verifiziert")
+    return push_output
 
 
 # ============================================================
@@ -353,8 +436,9 @@ def commit_and_push(files: list[str], message: str, branch_name: str) -> str:
 def create_task_workflow(task_id: str, task_title: str, task_body: str) -> dict:
     """
     Kompletter Workflow: Branch + Issue + optional Status setzen.
+    Branch wird sofort lokal ausgecheckt damit der Developer darauf arbeitet.
     """
-    # 1. Feature Branch erstellen
+    # 1. Feature Branch erstellen + lokal auschecken
     branch_name = create_feature_branch(task_id)
 
     # 2. Issue mit Assignee erstellen + optional zum Project hinzufügen
@@ -387,7 +471,7 @@ def start_task(task: dict) -> str:
 
     branch_name = task.get("branch_name", "")
     if branch_name:
-        checkout_branch(branch_name)
+        ensure_on_branch(branch_name)
 
     print(f"  🚀 Task gestartet: {branch_name}")
     return branch_name
