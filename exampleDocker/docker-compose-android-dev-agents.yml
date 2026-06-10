@@ -1,0 +1,15 @@
+services:
+  dev:
+    image: docker-android-dev-agents
+    volumes:
+      - ./android-dev-agents:/app/android-dev-agents
+      - ./MosquitoBuzzV5:/app/MosquitoBuzzV5
+      - ~/.gitconfig:/root/.gitconfig:ro
+      - ~/.ssh:/root/.ssh:ro
+      - ~/.config/gh:/root/.config/gh:ro
+    env_file:
+      - ./android-dev-agents/.env
+    working_dir: /app
+    stdin_open: true
+    tty: true
+

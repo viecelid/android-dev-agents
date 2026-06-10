@@ -1,0 +1,19 @@
+# LangGraph & LangChain
+langgraph
+langchain
+langchain-openai
+langchain-community
+langchain-core
+
+# Data Models & Config
+pydantic
+pydantic-settings
+python-dotenv
+
+# GitHub
+PyGithub
+httpx
+
+# UI
+rich
+langgraph-checkpoint-sqlite
