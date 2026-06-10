@@ -17,6 +17,9 @@ repo = g.get_repo(settings.github_repo)
 GRAPHQL_URL = "https://api.github.com/graphql"
 GRAPHQL_HEADERS = {"Authorization": f"Bearer {settings.github_token}"}
 
+# ── Project Board aktiv? ──
+PROJECT_ENABLED = settings.github_project_number > 0
+
 
 # ============================================================
 # 🔑 Project ID
@@ -25,8 +28,11 @@ GRAPHQL_HEADERS = {"Authorization": f"Bearer {settings.github_token}"}
 _project_id_cache: str | None = None
 
 
-def get_project_id() -> str:
-    """Holt die GitHub Project v2 Node-ID (gecacht)."""
+def get_project_id() -> str | None:
+    """Holt die GitHub Project v2 Node-ID (gecacht). Returns None wenn deaktiviert."""
+    if not PROJECT_ENABLED:
+        return None
+
     global _project_id_cache
     if _project_id_cache:
         return _project_id_cache
@@ -56,9 +62,10 @@ def get_project_id() -> str:
         except (KeyError, TypeError):
             continue
 
-    raise ValueError(
-        f"❌ Project #{settings.github_project_number} nicht gefunden für '{owner}'"
+    print(
+        f"  ⚠️ Project #{settings.github_project_number} nicht gefunden für '{owner}' – wird übersprungen"
     )
+    return None
 
 
 # ============================================================
@@ -69,11 +76,18 @@ _status_field_cache = None
 _status_options_cache = None
 
 
-def get_project_fields() -> tuple[str, dict]:
+def get_project_fields() -> tuple[str, dict] | tuple[None, None]:
     """Holt die Status-Feld-ID und alle Status-Optionen."""
+    if not PROJECT_ENABLED:
+        return None, None
+
     global _status_field_cache, _status_options_cache
     if _status_field_cache and _status_options_cache:
         return _status_field_cache, _status_options_cache
+
+    project_id = get_project_id()
+    if not project_id:
+        return None, None
 
     query = """
     query($projectId: ID!) {
@@ -94,7 +108,7 @@ def get_project_fields() -> tuple[str, dict]:
     """
     resp = httpx.post(GRAPHQL_URL, json={
         "query": query,
-        "variables": {"projectId": get_project_id()}
+        "variables": {"projectId": project_id}
     }, headers=GRAPHQL_HEADERS)
 
     data = resp.json()
@@ -109,15 +123,22 @@ def get_project_fields() -> tuple[str, dict]:
             print(f"  📋 Status-Optionen: {list(_status_options_cache.keys())}")
             return _status_field_cache, _status_options_cache
 
-    raise ValueError("❌ Status-Feld nicht im Project gefunden!")
+    print("  ⚠️ Status-Feld nicht im Project gefunden – wird übersprungen")
+    return None, None
 
 
 def set_project_item_status(item_id: str, status: str):
     """Setzt den Status eines Project Items."""
+    if not PROJECT_ENABLED or not item_id:
+        return None
+
     try:
         field_id, options = get_project_fields()
     except ValueError as e:
         print(f"  ⚠️ {e}")
+        return None
+
+    if not field_id or not options:
         return None
 
     if status not in options:
@@ -153,7 +174,7 @@ def set_project_item_status(item_id: str, status: str):
 # ============================================================
 
 def create_issue_with_assignee(title: str, body: str, assignee: str = None) -> dict:
-    """Erstellt ein GitHub Issue mit Assignee + fügt es zum Project hinzu."""
+    """Erstellt ein GitHub Issue mit Assignee + fügt es optional zum Project hinzu."""
     issue = repo.create_issue(
         title=title,
         body=body,
@@ -161,30 +182,34 @@ def create_issue_with_assignee(title: str, body: str, assignee: str = None) -> d
     )
     print(f"  👤 Issue #{issue.number} erstellt, Assignee: {assignee or 'keiner'}")
 
-    # Issue zum Project hinzufügen
-    query = """
-    mutation($projectId: ID!, $contentId: ID!) {
-        addProjectV2ItemByContentId(input: {
-            projectId: $projectId
-            contentId: $contentId
-        }) { item { id } }
-    }
-    """
-    resp = httpx.post(GRAPHQL_URL, json={
-        "query": query,
-        "variables": {
-            "projectId": get_project_id(),
-            "contentId": issue.node_id,
-        }
-    }, headers=GRAPHQL_HEADERS)
+    # Issue zum Project hinzufügen (nur wenn Project aktiv)
+    item_id = None
+    project_id = get_project_id()
 
-    data = resp.json()
-    item_id = (
-        data.get("data", {})
-        .get("addProjectV2ItemByContentId", {})
-        .get("item", {})
-        .get("id")
-    )
+    if project_id:
+        query = """
+        mutation($projectId: ID!, $contentId: ID!) {
+            addProjectV2ItemByContentId(input: {
+                projectId: $projectId
+                contentId: $contentId
+            }) { item { id } }
+        }
+        """
+        resp = httpx.post(GRAPHQL_URL, json={
+            "query": query,
+            "variables": {
+                "projectId": project_id,
+                "contentId": issue.node_id,
+            }
+        }, headers=GRAPHQL_HEADERS)
+
+        data = resp.json()
+        item_id = (
+            data.get("data", {})
+            .get("addProjectV2ItemByContentId", {})
+            .get("item", {})
+            .get("id")
+        )
 
     return {
         "issue_number": issue.number,
@@ -313,12 +338,12 @@ def commit_and_push(files: list[str], message: str, branch_name: str) -> str:
 
 def create_task_workflow(task_id: str, task_title: str, task_body: str) -> dict:
     """
-    Kompletter Workflow: Branch + Issue + Status setzen.
+    Kompletter Workflow: Branch + Issue + optional Status setzen.
     """
     # 1. Feature Branch erstellen
     branch_name = create_feature_branch(task_id)
 
-    # 2. Issue mit Assignee erstellen + zum Project hinzufügen
+    # 2. Issue mit Assignee erstellen + optional zum Project hinzufügen
     assignee = settings.github_repo.split("/")[0]
     issue_data = create_issue_with_assignee(
         title=task_title,
@@ -326,7 +351,7 @@ def create_task_workflow(task_id: str, task_title: str, task_body: str) -> dict:
         assignee=assignee,
     )
 
-    # 3. Status auf "Todo"
+    # 3. Status auf "Todo" (nur wenn Project aktiv)
     if issue_data.get("project_item_id"):
         set_project_item_status(issue_data["project_item_id"], "Todo")
 
@@ -363,7 +388,7 @@ def complete_task(
     Schliesst einen Task ab:
     1. Commit + Push
     2. Pull Request erstellen (auto-close Issue)
-    3. Status → Done
+    3. Status → Done (nur wenn Project aktiv)
     """
     branch_name = task.get("branch_name", "")
     issue_data = task.get("issue_data", {})
@@ -385,7 +410,7 @@ def complete_task(
         issue_number=issue_number,
     )
 
-    # 3. Status → Done
+    # 3. Status → Done (nur wenn Project aktiv)
     item_id = issue_data.get("project_item_id")
     if item_id:
         set_project_item_status(item_id, "Done")
