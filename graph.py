@@ -146,11 +146,8 @@ def tester_node(state: dict) -> dict:
 
 def _normalize_input(raw: str) -> str:
     """Normalisiert Terminal-Input – entfernt unsichtbare Zeichen."""
-    # Strip whitespace
     cleaned = raw.strip()
-    # Entferne non-ASCII und Kontrollzeichen
     cleaned = "".join(c for c in cleaned if c.isprintable() or c == " ")
-    # Nochmal strip falls was übrig blieb
     cleaned = cleaned.strip()
     return cleaned
 
@@ -310,30 +307,34 @@ def _run_commit(state: dict) -> dict:
     # ── Commit & Push ──
     all_files = list(set(written_files + list(generated_code.keys())))
 
-    commit_and_push(
+    push_result = commit_and_push(
         files=all_files,
         message="feat(" + task.id + "): " + task.title,
         branch_name=branch,
     )
 
-    # ── Pull Request erstellen ──
-    issue_number = None
-    if hasattr(task, "issue_data") and task.issue_data:
-        issue_number = task.issue_data.get("number")
+    # ── Pull Request erstellen (nur wenn Commits vorhanden) ──
+    if push_result == "nothing to commit":
+        print(f"  ⚠️ Keine Änderungen – PR wird übersprungen")
+        pr_url = "n/a (keine Änderungen)"
+    else:
+        issue_number = None
+        if hasattr(task, "issue_data") and task.issue_data:
+            issue_number = task.issue_data.get("number")
 
-    files_list = "\n".join("- `" + f + "`" for f in all_files)
+        files_list = "\n".join("- `" + f + "`" for f in all_files)
 
-    pr_url = create_pull_request(
-        branch=branch,
-        title=task.id + ": " + task.title,
-        body=(
-            "## " + task.title + "\n\n"
-            + task.description + "\n\n"
-            "### Geänderte Dateien (" + str(len(all_files)) + ")\n"
-            + files_list
-        ),
-        issue_number=issue_number,
-    )
+        pr_url = create_pull_request(
+            branch=branch,
+            title=task.id + ": " + task.title,
+            body=(
+                "## " + task.title + "\n\n"
+                + task.description + "\n\n"
+                "### Geänderte Dateien (" + str(len(all_files)) + ")\n"
+                + files_list
+            ),
+            issue_number=issue_number,
+        )
 
     # ── GitHub Project Status → Done ──
     if hasattr(task, "issue_data") and task.issue_data:
@@ -342,6 +343,9 @@ def _run_commit(state: dict) -> dict:
             set_project_item_status(item_id, "Done")
 
     # ── Issue schliessen ──
+    issue_number = None
+    if hasattr(task, "issue_data") and task.issue_data:
+        issue_number = task.issue_data.get("number")
     if issue_number:
         close_issue(issue_number)
 

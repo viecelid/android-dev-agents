@@ -281,15 +281,22 @@ def create_pull_request(
     if issue_number:
         body += f"\n\nCloses #{issue_number}"
 
-    pr = repo.create_pull(
-        title=title,
-        body=body,
-        head=branch,
-        base=settings.default_base_branch,
-        draft=True,
-    )
-    print(f"  🔀 PR erstellt: {pr.html_url}")
-    return pr.html_url
+    try:
+        pr = repo.create_pull(
+            title=title,
+            body=body,
+            head=branch,
+            base=settings.default_base_branch,
+            draft=True,
+        )
+        print(f"  🔀 PR erstellt: {pr.html_url}")
+        return pr.html_url
+    except Exception as e:
+        if "No commits between" in str(e):
+            print(f"  ⚠️ Keine Commits zwischen {settings.default_base_branch} und {branch} – PR übersprungen")
+            return "n/a (keine Änderungen)"
+        else:
+            raise
 
 
 # ============================================================
@@ -322,10 +329,17 @@ def commit_and_push(files: list[str], message: str, branch_name: str) -> str:
     """Staged, committed und pusht Dateien auf den Feature-Branch."""
     checkout_branch(branch_name)
 
-    for file_path in files:
-        git_local(f"add {file_path}")
+    # Stage alle Änderungen (sicherer als einzelne Dateien mit Pfad-Problemen)
+    git_local("add -A")
 
-    git_local(f'commit -m "{message}"')
+    # Prüfe ob es etwas zu committen gibt
+    status = git_local("status --porcelain")
+    if not status.strip():
+        print(f"  ⚠️ Keine Änderungen zu committen auf {branch_name}")
+        return "nothing to commit"
+
+    result = git_local(f'commit -m "{message}"')
+    print(f"  📝 Commit: {message}")
 
     output = git_local(f"push origin {branch_name}")
     print(f"  📦 Push: {message} ({len(files)} Dateien)")
@@ -395,20 +409,24 @@ def complete_task(
     issue_number = issue_data.get("issue_number")
 
     # 1. Commit + Push
-    commit_and_push(files, commit_msg, branch_name)
+    push_result = commit_and_push(files, commit_msg, branch_name)
 
-    # 2. PR erstellen
-    pr_url = create_pull_request(
-        branch=branch_name,
-        title=commit_msg,
-        body=(
-            f"## Änderungen\n"
-            f"{commit_msg}\n\n"
-            f"### Geänderte Dateien\n"
-            + "\n".join(f"- `{f}`" for f in files)
-        ),
-        issue_number=issue_number,
-    )
+    # 2. PR erstellen (nur wenn Commits vorhanden)
+    if push_result == "nothing to commit":
+        print(f"  ⚠️ Keine Änderungen – PR wird übersprungen")
+        pr_url = "n/a (keine Änderungen)"
+    else:
+        pr_url = create_pull_request(
+            branch=branch_name,
+            title=commit_msg,
+            body=(
+                f"## Änderungen\n"
+                f"{commit_msg}\n\n"
+                f"### Geänderte Dateien\n"
+                + "\n".join(f"- `{f}`" for f in files)
+            ),
+            issue_number=issue_number,
+        )
 
     # 3. Status → Done (nur wenn Project aktiv)
     item_id = issue_data.get("project_item_id")
