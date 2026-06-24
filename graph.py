@@ -62,10 +62,12 @@ def planner_node(state: dict) -> dict:
     """
     phase = state.get("phase", "plan")
     current_task = state.get("current_task")
+    tasks = state.get("tasks", [])
 
     # ── Task abgeschlossen → Done (zurück zur main.py Loop) ──
-    if phase == "plan" and current_task is None and state.get("completed_tasks"):
-        tasks = state.get("tasks", [])
+    # NUR wenn es bereits Tasks in DIESEM Durchlauf gab (tasks nicht leer)
+    # UND kein aktueller Task mehr offen ist
+    if phase == "plan" and current_task is None and tasks:
         remaining = [t for t in tasks if t.status == "Todo"]
 
         if not remaining:

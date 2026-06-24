@@ -1,7 +1,7 @@
 # main.py
 
 import os
-import time
+import json
 from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
@@ -20,6 +20,27 @@ console = Console()
 
 THREAD_ID = "dev-v1"
 MAX_TOTAL_CODE_CHARS = 200000
+SESSION_FILE = Path("checkpoints/session.json")
+
+
+# ============================================================
+# 💾 Session State (persistent für Resume)
+# ============================================================
+
+def _load_session() -> dict:
+    """Lädt den Session-State aus der JSON-Datei."""
+    if SESSION_FILE.exists():
+        try:
+            return json.loads(SESSION_FILE.read_text())
+        except Exception:
+            pass
+    return {"task_counter": 0, "active_thread": None, "completed_tasks": []}
+
+
+def _save_session(session: dict):
+    """Speichert den Session-State."""
+    SESSION_FILE.parent.mkdir(exist_ok=True)
+    SESSION_FILE.write_text(json.dumps(session, indent=2))
 
 
 # ============================================================
@@ -173,7 +194,7 @@ def _handle_interrupt():
         "Checkpoint wurde automatisch gespeichert.\n"
         "Starte das Script neu um fortzufahren:\n\n"
         "   [cyan]python main.py[/cyan]\n\n"
-        "Thread-ID [cyan]" + THREAD_ID + "[/cyan] wird automatisch fortgesetzt.",
+        "Der letzte Task wird automatisch fortgesetzt.",
         style="bold yellow",
     ))
 
@@ -207,13 +228,25 @@ def _print_project_summary(project_data: dict):
 # 🔄 Resume-Logik
 # ============================================================
 
-def _try_resume(config: dict) -> bool:
+def _try_resume() -> bool:
     """
-    Versucht einen bestehenden Checkpoint fortzusetzen.
-    Returns: True wenn fortgesetzt/beendet, False wenn neu starten.
+    Versucht den letzten aktiven Task fortzusetzen.
+    Returns: True wenn fortgesetzt wurde (danach → development_loop), False wenn nichts offen.
     """
+    session = _load_session()
+    active_thread = session.get("active_thread")
+
+    if not active_thread:
+        return False
+
+    # Prüfe den Checkpoint des aktiven Threads
+    resume_config = {
+        "configurable": {"thread_id": active_thread},
+        "recursion_limit": 100,
+    }
+
     try:
-        state = app.get_state(config)
+        state = app.get_state(resume_config)
         values = (
             state.values
             if hasattr(state, "values")
@@ -221,51 +254,72 @@ def _try_resume(config: dict) -> bool:
         )
         phase = values.get("phase", "")
 
-        # ── "done" oder leer = fertig → direkt zur development_loop ──
+        # "done" oder leer = Task war fertig → nichts zu resumen
         if phase == "done" or phase == "":
+            session["active_thread"] = None
+            _save_session(session)
             return False
 
-        # ── Checkpoint vorhanden → Fortsetzen? ──
-        if phase and phase != "await_instruction":
-            task = values.get("current_task")
-            completed = values.get("completed_tasks", [])
-            retry_count = values.get("retry_count", 0)
+        # ── Offener Task gefunden → Fortsetzen? ──
+        task = values.get("current_task")
+        completed = values.get("completed_tasks", [])
+        retry_count = values.get("retry_count", 0)
 
-            resume_info = (
-                f"🔄 Fortsetzen vom letzten Checkpoint\n\n"
-                f"   Phase: [cyan]{phase}[/cyan]\n"
+        resume_info = (
+            f"🔄 Offener Task gefunden\n\n"
+            f"   Thread: [cyan]{active_thread}[/cyan]\n"
+            f"   Phase: [cyan]{phase}[/cyan]\n"
+        )
+        if task:
+            resume_info += f"   Task: [cyan]{task.id} – {task.title}[/cyan]\n"
+        resume_info += (
+            f"   Branch: [cyan]{values.get('current_branch', '?')}[/cyan]\n"
+            f"   Erledigt: [green]{len(completed)}[/green] Tasks\n"
+            f"   Retries: {retry_count}"
+        )
+
+        console.print(Panel(resume_info, style="bold blue"))
+
+        if Confirm.ask("Fortfahren?"):
+            console.print(
+                "\n[bold green]▶️  Graph wird fortgesetzt...[/bold green]\n"
             )
-            if task:
-                resume_info += f"   Task: [cyan]{task.id} – {task.title}[/cyan]\n"
-            resume_info += (
-                f"   Branch: [cyan]{values.get('current_branch', '?')}[/cyan]\n"
-                f"   Erledigt: [green]{len(completed)}[/green] Tasks\n"
-                f"   Retries: {retry_count}"
-            )
-
-            console.print(Panel(resume_info, style="bold blue"))
-
-            if Confirm.ask("Fortfahren?"):
-                console.print(
-                    "\n[bold green]▶️  Graph wird fortgesetzt...[/bold green]\n"
-                )
-                try:
-                    for event in app.stream(None, config, stream_mode="values"):
-                        _print_phase(event)
-                except KeyboardInterrupt:
-                    _handle_interrupt()
+            try:
+                for event in app.stream(None, resume_config, stream_mode="values"):
+                    _print_phase(event)
+            except KeyboardInterrupt:
+                _handle_interrupt()
                 return True
 
-            if Confirm.ask("🔄 Stattdessen neu starten?"):
-                return False
+            # Task fertig → Session aufräumen
+            try:
+                state = app.get_state(resume_config)
+                values = (
+                    state.values
+                    if hasattr(state, "values")
+                    else state.get("values", {})
+                )
+                session["completed_tasks"] = values.get("completed_tasks", completed)
+            except Exception:
+                pass
 
-            console.print("[yellow]Beendet.[/yellow]")
+            session["active_thread"] = None
+            _save_session(session)
             return True
 
-    except Exception:
-        pass
+        # User will nicht fortfahren → Thread verwerfen
+        if Confirm.ask("🗑️  Offenen Task verwerfen und neu starten?"):
+            session["active_thread"] = None
+            _save_session(session)
+            return False
 
-    return False
+        console.print("[yellow]Beendet.[/yellow]")
+        return True
+
+    except Exception:
+        session["active_thread"] = None
+        _save_session(session)
+        return False
 
 
 # ============================================================
@@ -278,9 +332,14 @@ def development_loop(config: dict, project_data: dict):
     Jede Anweisung bekommt eine eigene Thread-ID um Checkpoint-Konflikte zu vermeiden.
     """
 
+    # ── Session laden ──
+    session = _load_session()
+    completed_tasks = session.get("completed_tasks", [])
+    task_counter = session.get("task_counter", 0)
+
     # ── Initiale Projekt-Analyse (nur bei bestehendem Projekt) ──
     if project_data["project_initialized"]:
-        if Confirm.ask("🔍 Projekt-Analyse anzeigen?", default=True):
+        if Confirm.ask("🔍 Projekt-Analyse anzeigen?", default=False):
             _run_initial_analysis(project_data)
 
     # ── Interaktive Loop starten ──
@@ -294,9 +353,6 @@ def development_loop(config: dict, project_data: dict):
         "  [cyan]Ctrl+C[/cyan] – Pausieren (Checkpoint wird gespeichert)",
         style="bold blue",
     ))
-
-    completed_tasks = []
-    task_counter = 0
 
     while True:
         # ── Auf Anweisung warten ──
@@ -319,12 +375,19 @@ def development_loop(config: dict, project_data: dict):
                 _print_completed_tasks(completed_tasks)
             continue
 
-        # ── Neuer Thread pro Anweisung (verhindert Checkpoint-Konflikt) ──
+        # ── Neuer Thread pro Anweisung ──
         task_counter += 1
+        task_thread_id = f"{THREAD_ID}-task-{task_counter}"
         task_config = {
-            "configurable": {"thread_id": f"{THREAD_ID}-task-{task_counter}"},
+            "configurable": {"thread_id": task_thread_id},
             "recursion_limit": 100,
         }
+
+        # ── Session speichern: aktiver Thread (für Resume bei Crash/Ctrl+C) ──
+        session["task_counter"] = task_counter
+        session["active_thread"] = task_thread_id
+        session["completed_tasks"] = completed_tasks
+        _save_session(session)
 
         # ── Graph mit Anweisung starten ──
         console.print(
@@ -338,6 +401,8 @@ def development_loop(config: dict, project_data: dict):
             project_initialized=project_data["project_initialized"],
             human_instruction=instruction,
             completed_tasks=completed_tasks,
+            tasks=[],
+            current_task=None,
         )
 
         try:
@@ -346,6 +411,7 @@ def development_loop(config: dict, project_data: dict):
 
             # ── Nach Task: Projekt neu einlesen ──
             project_data = load_project()
+
             # Erledigte Tasks aus State holen
             try:
                 state = app.get_state(task_config)
@@ -357,6 +423,12 @@ def development_loop(config: dict, project_data: dict):
                 completed_tasks = values.get("completed_tasks", completed_tasks)
             except Exception:
                 pass
+
+            # ── Session updaten: Task fertig, kein aktiver Thread mehr ──
+            session["task_counter"] = task_counter
+            session["active_thread"] = None
+            session["completed_tasks"] = completed_tasks
+            _save_session(session)
 
         except KeyboardInterrupt:
             _handle_interrupt()
@@ -381,7 +453,7 @@ def run():
         "  💻 Developer → implementiert Code\n"
         "  🧪 Tester → prüft Build + Tests\n"
         "  👤 Du → gibst Anweisungen & reviewst\n\n"
-        f"Thread-ID: [cyan]{THREAD_ID}[/cyan]",
+        f"Session: [cyan]{SESSION_FILE}[/cyan]",
         style="bold green",
     ))
 
@@ -390,9 +462,8 @@ def run():
         "recursion_limit": 100,
     }
 
-    # ── Resume-Check ──
-    if _try_resume(config):
-        return
+    # ── Resume-Check (sucht aktiven Thread in session.json) ──
+    resumed = _try_resume()
 
     # ── Projekt laden ──
     project_data = load_project()
@@ -414,6 +485,11 @@ def run():
                 "recursion_limit": 100,
             }
 
+            # Session: Scaffold als aktiven Thread markieren
+            session = _load_session()
+            session["active_thread"] = f"{THREAD_ID}-scaffold"
+            _save_session(session)
+
             # Graph mit Scaffold-Anweisung starten
             initial_state = AgentState(
                 messages=[],
@@ -431,6 +507,8 @@ def run():
                     f"einfachen 'Hello World' MainActivity."
                 ),
                 completed_tasks=[],
+                tasks=[],
+                current_task=None,
             )
 
             console.print("\n[bold green]🤖 Scaffold wird erstellt...[/bold green]\n")
@@ -441,6 +519,11 @@ def run():
             except KeyboardInterrupt:
                 _handle_interrupt()
                 return
+
+            # Scaffold fertig → Session aufräumen
+            session = _load_session()
+            session["active_thread"] = None
+            _save_session(session)
 
             # Projekt neu laden nach Scaffold
             project_data = load_project()
