@@ -56,7 +56,7 @@ def planner_node(state: dict) -> dict:
     🏗️ Planner Node – plant Tasks basierend auf der Human-Anweisung.
 
     Phasen:
-      - "plan"                  → Neue Anweisung → Plan erstellen
+      - "plan"                  → Neue Anweisung / nächster Task aus Plan
       - "review_plan_approved"  → Human hat OK gegeben → Task starten
       - "review_plan_rejected"  → Human hat Feedback → Plan überarbeiten
     """
@@ -64,11 +64,10 @@ def planner_node(state: dict) -> dict:
     current_task = state.get("current_task")
     tasks = state.get("tasks", [])
 
-    # ── Task abgeschlossen → Done (zurück zur main.py Loop) ──
-    # NUR wenn es bereits Tasks in DIESEM Durchlauf gab (tasks nicht leer)
-    # UND kein aktueller Task mehr offen ist
+    # ── Alle Tasks erledigt → Done ──
+    # NUR wenn Tasks geplant wurden UND keiner mehr offen ist
     if phase == "plan" and current_task is None and tasks:
-        remaining = [t for t in tasks if t.status == "Todo"]
+        remaining = [t for t in tasks if t.status in ("Todo", "In Progress")]
 
         if not remaining:
             completed = state.get("completed_tasks", [])
@@ -162,18 +161,24 @@ def human_review(state: dict) -> dict:
     phase = state.get("phase", "")
     task = state.get("current_task")
     retry_count = state.get("retry_count", 0)
+    tasks = state.get("tasks", [])
     task_id = task.id if task else "N/A"
     task_title = task.title if task else "N/A"
 
+    # ── Task-Fortschritt anzeigen ──
+    total_tasks = len(tasks)
+    completed_count = len([t for t in tasks if t.status == "Done"])
+    progress = f"[{completed_count + 1}/{total_tasks}]" if total_tasks > 1 else ""
+
     # ── Console Header ──
     if phase == "review_plan":
-        print(f"\n👤 Review: Plan ({task_id})")
+        print(f"\n👤 Review: Plan {progress} ({task_id})")
     elif phase == "review_dev":
-        print(f"\n👤 Review: Code ({task_id})")
+        print(f"\n👤 Review: Code {progress} ({task_id})")
     elif phase == "review_pr":
-        print(f"\n👤 Review: Test-Ergebnis / PR ({task_id})")
+        print(f"\n👤 Review: Test-Ergebnis / PR {progress} ({task_id})")
     elif phase == "develop_retry":
-        print(f"\n👤 Review: Build-Fehler ({task_id})")
+        print(f"\n👤 Review: Build-Fehler {progress} ({task_id})")
 
     # ── Zeige Retry-Info wenn Max erreicht ──
     if phase == "develop_retry" and retry_count >= MAX_RETRIES:
@@ -192,9 +197,17 @@ def human_review(state: dict) -> dict:
     print(f"{'─' * 40}")
     print(f"  [Input erkannt: '{feedback}']")
 
-    # ── Skip → Task überspringen ──
+    # ── Skip → Task überspringen, nächsten aus Plan nehmen ──
     if feedback.lower() in ("skip", "überspringen", "next"):
         print(f"  ⏭️ Task {task_id} übersprungen")
+
+        # Task als Done markieren in der Liste (übersprungen)
+        updated_tasks = list(tasks)
+        for i, t in enumerate(updated_tasks):
+            if t.id == task_id:
+                updated_tasks[i].status = "Done"
+                break
+
         return {
             "human_feedback": "",
             "feedback_target": "",
@@ -205,6 +218,7 @@ def human_review(state: dict) -> dict:
             "test_results": "",
             "build_success": False,
             "current_branch": "",
+            "tasks": updated_tasks,
             "phase": "plan",
         }
 
@@ -290,6 +304,7 @@ def human_review(state: dict) -> dict:
 def _run_commit(state: dict) -> dict:
     """
     📦 Commit Node – committed Code und erstellt PR.
+    Markiert den Task als Done und geht zum nächsten.
     """
     task = state.get("current_task")
     if not task:
@@ -301,6 +316,7 @@ def _run_commit(state: dict) -> dict:
     branch = state.get("current_branch", "")
     written_files = state.get("written_files", [])
     generated_code = state.get("generated_code", {})
+    tasks = state.get("tasks", [])
 
     print("\n" + "=" * 60)
     print("📦  COMMIT & PR")
@@ -351,7 +367,14 @@ def _run_commit(state: dict) -> dict:
     if issue_number:
         close_issue(issue_number)
 
-    # ── Task als erledigt markieren ──
+    # ── Task als Done markieren in der Tasks-Liste ──
+    updated_tasks = list(tasks)
+    for i, t in enumerate(updated_tasks):
+        if t.id == task.id:
+            updated_tasks[i].status = "Done"
+            break
+
+    # ── Task als erledigt in completed_tasks speichern ──
     completed = list(state.get("completed_tasks", []))
     completed.append({
         "id": task.id,
@@ -361,10 +384,15 @@ def _run_commit(state: dict) -> dict:
         "files": all_files,
     })
 
+    # ── Prüfe ob noch Tasks offen sind ──
+    remaining = [t for t in updated_tasks if t.status == "Todo"]
+    remaining_info = f"  📋 Noch {len(remaining)} Task(s) offen" if remaining else "  🎉 Alle Tasks erledigt!"
+
     print(f"\n  📋 Task: {task.id} – {task.title}")
     print(f"  🌿 Branch: {branch}")
     print(f"  🔀 PR: {pr_url}")
     print(f"  📊 Total erledigt: {len(completed)}")
+    print(remaining_info)
     print("=" * 60)
 
     return {
@@ -374,6 +402,7 @@ def _run_commit(state: dict) -> dict:
             "📊 Total erledigt: " + str(len(completed))
         ))],
         "completed_tasks": completed,
+        "tasks": updated_tasks,
         "current_task": None,
         "generated_code": {},
         "written_files": [],
@@ -428,7 +457,7 @@ def route_after_human_review(state: dict) -> str:
     elif phase == "develop_retry":
         return "developer"
 
-    # Skip → zurück zum Planner
+    # Skip → zurück zum Planner (nächster Task)
     elif phase == "plan":
         return "planner"
 
@@ -486,7 +515,7 @@ workflow.add_conditional_edges("human_review", route_after_human_review)
 workflow.add_conditional_edges("developer", route_after_developer)
 workflow.add_conditional_edges("tester", route_after_tester)
 
-# ── Commit → zurück zum Planner ──
+# ── Commit → zurück zum Planner (nächster Task oder Done) ──
 workflow.add_edge("commit", "planner")
 
 # ── Graph kompilieren ──

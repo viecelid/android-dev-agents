@@ -1,6 +1,7 @@
 # agents/planner.py
 
 import os
+import time
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import AIMessage
@@ -54,6 +55,8 @@ class PlannedTask(BaseModel):
     def hints_to_string(cls, v):
         if isinstance(v, list):
             return "\n".join(str(item) for item in v)
+        if v is None:
+            return ""
         return v
 
     @field_validator("description", mode="before")
@@ -61,13 +64,15 @@ class PlannedTask(BaseModel):
     def description_to_string(cls, v):
         if isinstance(v, list):
             return "\n".join(str(item) for item in v)
+        if v is None:
+            return ""
         return v
 
 
 class PlannerOutput(BaseModel):
-    """Strukturierter Output – NUR EIN Task pro Aufruf."""
+    """Strukturierter Output – ein oder mehrere Tasks."""
     analysis: str
-    task: PlannedTask
+    tasks: list[PlannedTask]
     remaining_plan_summary: str = ""
     total_estimated_tasks: int = 1
     plan_adjustments: str = ""
@@ -86,6 +91,14 @@ class PlannerOutput(BaseModel):
     def ensure_int(cls, v):
         if v is None:
             return 1
+        return v
+
+    @field_validator("tasks", mode="before")
+    @classmethod
+    def ensure_list(cls, v):
+        """Falls LLM nur einen Task als Objekt zurückgibt → in Liste wrappen."""
+        if isinstance(v, dict):
+            return [v]
         return v
 
 
@@ -122,9 +135,10 @@ def _truncate_code_contents(code_contents: str) -> str:
 def run_planner(state: dict) -> dict:
     """
     🏗️ Planner Node:
-    - Plant NUR EINEN Task pro Aufruf basierend auf der Human-Anweisung
+    - Plant einen oder mehrere Tasks basierend auf der Human-Anweisung
     - Baut Kontext aus aktuellem Projekt-Stand + Anweisung
     - Erstellt NOCH KEINE GitHub-Ressourcen (erst nach Human OK)
+    - Setzt den ERSTEN Task als current_task, Rest bleibt "Todo"
     """
 
     # ── State lesen ──
@@ -142,6 +156,26 @@ def run_planner(state: dict) -> dict:
     # ── Erkennen warum wir hier sind ──
     is_feedback_run = feedback and feedback.strip().lower() != "ok"
     is_continuation = len(completed) > 0 and not is_feedback_run
+
+    # ── Noch offene Tasks aus vorheriger Planung? → nächsten starten ──
+    if not is_feedback_run and tasks:
+        remaining = [t for t in tasks if t.status == "Todo"]
+        if remaining:
+            next_task = remaining[0]
+            print(f"\n  ➡️ Nächster Task aus Plan: {next_task.id} – {next_task.title}")
+            _print_single_task_summary(next_task, len(completed) + 1, len(tasks))
+            return {
+                "messages": [
+                    AIMessage(content=(
+                        "🏗️ Nächster Task: " + next_task.id + " – " + next_task.title + "\n"
+                        "⏸️ Warte auf Human Review..."
+                    ))
+                ],
+                "current_task": next_task,
+                "human_feedback": "",
+                "feedback_target": "",
+                "phase": "review_plan",
+            }
 
     if is_feedback_run:
         print(f"\n  🔄 PLANNER RE-RUN: Human Feedback einarbeiten...")
@@ -198,19 +232,7 @@ def run_planner(state: dict) -> dict:
             + completed_str + "\n"
         )
 
-    # 6️⃣ Offene Tasks (falls Anweisung mehrere Tasks erzeugt hat)
-    remaining = [t for t in tasks if t.status == "Todo"]
-    if remaining:
-        remaining_str = "\n".join(
-            "- " + t.id + " – " + t.title + " (Status: " + t.status + ")"
-            for t in remaining
-        )
-        context_parts.append(
-            "## 📋 Noch offene Tasks (" + str(len(remaining)) + "):\n"
-            + remaining_str + "\n"
-        )
-
-    # 7️⃣ Human Feedback (bei Rejection)
+    # 6️⃣ Human Feedback (bei Rejection)
     if is_feedback_run:
         prev_task_info = "Kein vorheriger Task."
         if current_task:
@@ -230,29 +252,62 @@ def run_planner(state: dict) -> dict:
     context = _truncate_context(context)
 
     # ════════════════════════════════════════════════════════
-    # 🤖 LLM aufrufen (Structured Output)
+    # 🤖 LLM aufrufen (Structured Output) mit Retry
     # ════════════════════════════════════════════════════════
     print(f"  🤖 Rufe LLM auf (Context: {len(context)} chars)...")
-    result: PlannerOutput = planner_chain.invoke({"context": context})
+
+    max_attempts = 3
+    result = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = planner_chain.invoke({"context": context})
+            break
+        except Exception as e:
+            print(f"  ⚠️ LLM-Aufruf fehlgeschlagen (Versuch {attempt}/{max_attempts}): {type(e).__name__}")
+            if attempt == max_attempts:
+                print(f"  ❌ Alle Versuche fehlgeschlagen: {e}")
+                result = PlannerOutput(
+                    analysis="Automatischer Fallback nach LLM-Fehler",
+                    tasks=[PlannedTask(
+                        id=f"TASK-{len(completed) + 1:03d}",
+                        title=human_instruction[:80],
+                        description=human_instruction,
+                        priority="medium",
+                        files_affected=[],
+                        implementation_hints="Bitte manuell überprüfen – LLM-Parsing fehlgeschlagen.",
+                    )],
+                    remaining_plan_summary="",
+                    total_estimated_tasks=1,
+                )
+            else:
+                time.sleep(2)
 
     # ════════════════════════════════════════════════════════
-    # 📋 Task erstellen
+    # 📋 Tasks erstellen
     # ════════════════════════════════════════════════════════
-    planned = result.task
-    task_index = len(completed) + 1
-    task_id = planned.id or f"TASK-{task_index:03d}"
+    planned_tasks = result.tasks
+    all_workflow_tasks = []
 
-    task = WorkflowTask(
-        id=task_id,
-        title=planned.title,
-        description=planned.description,
-        priority=planned.priority,
-        files_affected=planned.files_affected,
-        status="Todo",
-        branch_name=f"feature/{task_id}",
-    )
+    for i, planned in enumerate(planned_tasks):
+        task_index = len(completed) + i + 1
+        task_id = planned.id or f"TASK-{task_index:03d}"
 
-    # ── Planner-Entscheidungen konvertieren ──
+        wf_task = WorkflowTask(
+            id=task_id,
+            title=planned.title,
+            description=planned.description,
+            priority=planned.priority,
+            files_affected=planned.files_affected,
+            status="Todo",
+            branch_name=f"feature/{task_id}",
+        )
+        all_workflow_tasks.append(wf_task)
+
+    # Erster Task wird current_task
+    first_task = all_workflow_tasks[0]
+
+    # ── Planner-Entscheidungen vom ersten Task konvertieren ──
+    first_planned = planned_tasks[0]
     decisions = [
         PlannerDecision(
             component=d.component,
@@ -260,22 +315,11 @@ def run_planner(state: dict) -> dict:
             rationale=d.rationale,
             target_files=d.target_files,
         )
-        for d in planned.decisions
+        for d in first_planned.decisions
     ]
 
     # ── Console-Ausgabe ──
-    _print_plan_summary(task, planned, result, decisions, is_feedback_run, task_index)
-
-    # ── Tasks-Liste aktualisieren ──
-    updated_tasks = list(tasks)
-    existing_idx = next(
-        (i for i, t in enumerate(updated_tasks) if t.id == task.id),
-        None,
-    )
-    if existing_idx is not None:
-        updated_tasks[existing_idx] = task
-    else:
-        updated_tasks.append(task)
+    _print_plan_summary(all_workflow_tasks, planned_tasks, result, decisions, is_feedback_run, completed)
 
     # ════════════════════════════════════════════════════════
     # 📦 State updaten
@@ -283,18 +327,16 @@ def run_planner(state: dict) -> dict:
     return {
         "messages": [
             AIMessage(content=(
-                "🏗️ Plan: " + task.id + " – " + task.title + "\n"
-                "Priorität: " + task.priority + "\n"
-                "Dateien: " + ", ".join(task.files_affected) + "\n"
-                "Hinweise: " + planned.implementation_hints[:200] + "\n\n"
+                "🏗️ Plan: " + str(len(all_workflow_tasks)) + " Task(s) geplant\n"
+                "1️⃣ " + first_task.id + " – " + first_task.title + "\n"
                 "⏸️ Warte auf Human Review..."
             ))
         ],
         "project_analysis": result.analysis,
-        "tasks": updated_tasks,
-        "current_task": task,
+        "tasks": all_workflow_tasks,
+        "current_task": first_task,
         "planner_decisions": decisions,
-        "planner_hints": planned.implementation_hints,
+        "planner_hints": first_planned.implementation_hints,
         "human_feedback": "",
         "feedback_target": "",
         "phase": "review_plan",
@@ -305,7 +347,7 @@ def run_planner(state: dict) -> dict:
 # 🖨️ Console Output
 # ============================================================
 
-def _print_plan_summary(task, planned, result, decisions, is_feedback, task_index):
+def _print_plan_summary(all_tasks, planned_tasks, result, decisions, is_feedback, completed):
     print("\n" + "=" * 60)
     print("🏗️  PLANNER – Vorschlag (noch NICHT auf GitHub!)")
     print("=" * 60)
@@ -315,28 +357,49 @@ def _print_plan_summary(task, planned, result, decisions, is_feedback, task_inde
     if is_feedback:
         print(f"\n📝 Feedback eingearbeitet: ✅")
 
-    print(f"\n📋 Task {task_index}/{result.total_estimated_tasks}: "
-          f"{task.id} – {task.title}")
+    print(f"\n📊 Gesamtplan: {len(all_tasks)} Task(s)")
+    print(f"   Bereits erledigt: {len(completed)}")
+
+    for i, (task, planned) in enumerate(zip(all_tasks, planned_tasks)):
+        marker = "➡️" if i == 0 else "  "
+        print(f"\n{marker} Task {i + 1}/{len(all_tasks)}: {task.id} – {task.title}")
+        print(f"   Priorität: {task.priority}")
+        print(f"   Dateien: {', '.join(task.files_affected)}")
+        print(f"   Beschreibung: {task.description[:150]}...")
+
+        if i == 0:
+            print(f"\n💡 Developer-Anweisungen:\n   {planned.implementation_hints}")
+
+            if planned.decisions:
+                print(f"\n🏛️  Planner-Entscheidungen:")
+                for d in planned.decisions:
+                    print(f"   - {d.component}: {d.decision}")
+                    print(f"     Begründung: {d.rationale}")
+                    if d.target_files:
+                        print(f"     Dateien: {', '.join(d.target_files)}")
+
+            if planned.target_file_structure:
+                print(f"\n📂 Ziel-Dateistruktur:")
+                for path, desc in planned.target_file_structure.items():
+                    print(f"   - {path} → {desc}")
+
+    if result.remaining_plan_summary:
+        print(f"\n🔮 Restlicher Plan:\n   {result.remaining_plan_summary}")
+
+    print(f"\n⏸️  Branch + Issue werden erst nach deinem OK erstellt!")
+    print(f"   Erster Task: {all_tasks[0].id} – {all_tasks[0].title}")
+    print("=" * 60)
+
+
+def _print_single_task_summary(task, task_index, total):
+    """Zeigt einen einzelnen Task aus dem bestehenden Plan."""
+    print("\n" + "=" * 60)
+    print(f"🏗️  NÄCHSTER TASK ({task_index}/{total})")
+    print("=" * 60)
+    print(f"\n📋 {task.id} – {task.title}")
     print(f"   Priorität: {task.priority}")
     print(f"   Dateien: {', '.join(task.files_affected)}")
-    print(f"\n📝 Beschreibung:\n   {task.description}")
-    print(f"\n💡 Developer-Anweisungen:\n   {planned.implementation_hints}")
-
-    if decisions:
-        print(f"\n🏛️  Planner-Entscheidungen:")
-        for d in decisions:
-            print(f"   - {d.component}: {d.decision}")
-            print(f"     Begründung: {d.rationale}")
-            if d.target_files:
-                print(f"     Dateien: {', '.join(d.target_files)}")
-
-    if planned.target_file_structure:
-        print(f"\n📂 Ziel-Dateistruktur:")
-        for path, desc in planned.target_file_structure.items():
-            print(f"   - {path} → {desc}")
-
-    print(f"\n🔮 Restlicher Plan:\n   {result.remaining_plan_summary}")
-    print(f"   Geschätzte Tasks total: {result.total_estimated_tasks}")
+    print(f"   Beschreibung: {task.description[:200]}")
     print(f"\n⏸️  Branch + Issue werden erst nach deinem OK erstellt!")
     print("=" * 60)
 

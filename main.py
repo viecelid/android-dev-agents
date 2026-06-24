@@ -231,7 +231,9 @@ def _print_project_summary(project_data: dict):
 def _try_resume() -> bool:
     """
     Versucht den letzten aktiven Task fortzusetzen.
-    Returns: True wenn fortgesetzt wurde (danach → development_loop), False wenn nichts offen.
+    Returns:
+        True  → User will beenden (Ctrl+C oder "Beendet") → run() soll stoppen
+        False → Weiter zur development_loop (nichts zu resumen, oder erfolgreich resumed, oder verworfen)
     """
     session = _load_session()
     active_thread = session.get("active_thread")
@@ -280,7 +282,7 @@ def _try_resume() -> bool:
 
         console.print(Panel(resume_info, style="bold blue"))
 
-        if Confirm.ask("Fortfahren?"):
+        if Confirm.ask("▶️  Task fortsetzen und fertig machen?"):
             console.print(
                 "\n[bold green]▶️  Graph wird fortgesetzt...[/bold green]\n"
             )
@@ -289,7 +291,7 @@ def _try_resume() -> bool:
                     _print_phase(event)
             except KeyboardInterrupt:
                 _handle_interrupt()
-                return True
+                return True  # User will beenden
 
             # Task fertig → Session aufräumen
             try:
@@ -305,16 +307,16 @@ def _try_resume() -> bool:
 
             session["active_thread"] = None
             _save_session(session)
-            return True
+            return False  # Erfolgreich resumed → weiter zur development_loop
 
-        # User will nicht fortfahren → Thread verwerfen
-        if Confirm.ask("🗑️  Offenen Task verwerfen und neu starten?"):
+        # User will nicht fortfahren → verwerfen oder beenden?
+        if Confirm.ask("🗑️  Task verwerfen und mit neuer Anweisung starten?"):
             session["active_thread"] = None
             _save_session(session)
-            return False
+            return False  # Verworfen → weiter zur development_loop
 
-        console.print("[yellow]Beendet.[/yellow]")
-        return True
+        console.print("[yellow]👋 Beendet.[/yellow]")
+        return True  # User will komplett beenden
 
     except Exception:
         session["active_thread"] = None
@@ -464,6 +466,8 @@ def run():
 
     # ── Resume-Check (sucht aktiven Thread in session.json) ──
     resumed = _try_resume()
+    if resumed:
+        return  # User will beenden (hat "Beendet" gewählt oder Ctrl+C)
 
     # ── Projekt laden ──
     project_data = load_project()
