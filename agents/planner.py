@@ -68,8 +68,8 @@ class PlannerOutput(BaseModel):
     """Strukturierter Output – NUR EIN Task pro Aufruf."""
     analysis: str
     task: PlannedTask
-    remaining_plan_summary: str
-    total_estimated_tasks: int
+    remaining_plan_summary: str = ""
+    total_estimated_tasks: int = 1
     plan_adjustments: str = ""
 
     @field_validator("analysis", "remaining_plan_summary", "plan_adjustments", mode="before")
@@ -77,6 +77,15 @@ class PlannerOutput(BaseModel):
     def ensure_string(cls, v):
         if isinstance(v, list):
             return "\n".join(str(item) for item in v)
+        if v is None:
+            return ""
+        return v
+
+    @field_validator("total_estimated_tasks", mode="before")
+    @classmethod
+    def ensure_int(cls, v):
+        if v is None:
+            return 1
         return v
 
 
