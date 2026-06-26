@@ -94,7 +94,7 @@ def write_file(filepath: str, content: str) -> str:
         f.write(content)
     return filepath
 
-
+@tool
 def delete_file(filepath: str) -> str:
     """Löscht eine Datei aus dem Projekt."""
     full_path = os.path.join(settings.repo_path, filepath)

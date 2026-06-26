@@ -12,6 +12,7 @@ from tools.file_tools import (
     read_file_tool,
     list_files_tool,
     list_dir_tool,
+    delete_file_tool,
 )
 from tools.github_tools import (
     set_project_item_status,
@@ -30,11 +31,12 @@ _prompt_path = os.path.join(settings.prompts_dir, "developer_prompt.md")
 _system_prompt = open(_prompt_path, encoding="utf-8").read()
 _system_prompt = _system_prompt.replace("{", "{{").replace("}", "}}")
 
-# Developer-Tools (ein Repo – lesen + navigieren)
+# Developer-Tools (ein Repo – lesen + navigieren + löschen)
 developer_tools = [
     read_file_tool,
     list_files_tool,
     list_dir_tool,
+    delete_file_tool,
 ]
 
 # LLM mit Tools
@@ -136,6 +138,7 @@ TOOL_MAP = {
     "read_file_tool": read_file_tool,
     "list_files_tool": list_files_tool,
     "list_dir_tool": list_dir_tool,
+    "delete_file_tool": delete_file_tool,
 }
 
 
@@ -246,7 +249,7 @@ def run_developer(state: dict) -> dict:
     """
     💻 Developer Node:
     - Bekommt Task + Planner-Vorgaben als Daten-Context
-    - Kann Tools aufrufen (Dateien lesen, Verzeichnisse erkunden)
+    - Kann Tools aufrufen (Dateien lesen, Verzeichnisse erkunden, Dateien löschen)
     - Generiert Code via ### DATEI: Pattern
     - Alle Anweisungen stehen im developer_prompt.md
     """
@@ -371,7 +374,8 @@ def run_developer(state: dict) -> dict:
         "Du hast Zugriff auf diese Tools – nutze sie bei Bedarf:\n\n"
         "- `read_file_tool(filepath)` → Datei aus dem Projekt lesen\n"
         "- `list_files_tool(directory)` → Alle Dateien im Projekt listen\n"
-        "- `list_dir_tool(directory)` → Verzeichnis-Inhalt listen\n\n"
+        "- `list_dir_tool(directory)` → Verzeichnis-Inhalt listen\n"
+        "- `delete_file_tool(filepath)` → Datei aus dem Projekt löschen\n\n"
         "**Wichtig:** Nutze die Tools um bestehenden Code zu verstehen "
         "bevor du Änderungen machst.\n"
     )
