@@ -67,6 +67,15 @@ def _list_files(base_path: str, extensions: list[str] = None) -> list[str]:
 
 
 # ============================================================
+# 🧹 Unicode-Bereinigung
+# ============================================================
+
+def _sanitize_content(content: str) -> str:
+    """Entfernt ungültige Unicode-Zeichen (Surrogates) die API-Calls crashen."""
+    return content.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+
+
+# ============================================================
 # 📖 Datei-Operationen (einzelnes Repo)
 # ============================================================
 
@@ -74,12 +83,13 @@ def read_file(filepath: str) -> str | None:
     """Liest eine Text-Datei aus dem Projekt."""
     try:
         full_path = os.path.join(settings.repo_path, filepath)
-        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
+        with open(full_path, "rb") as f:
+            raw = f.read()
+        # Decode mit Surrogate-Handling und sofort bereinigen
+        content = raw.decode("utf-8", errors="surrogateescape")
+        content = _sanitize_content(content)
+        return content
     except FileNotFoundError:
-        return None
-    except UnicodeDecodeError:
-        print(f"  ⚠️ Binärdatei übersprungen: {filepath}")
         return None
     except Exception as e:
         print(f"  ⚠️ Fehler beim Lesen von {filepath}: {e}")
@@ -94,15 +104,27 @@ def write_file(filepath: str, content: str) -> str:
         f.write(content)
     return filepath
 
-@tool
+
 def delete_file(filepath: str) -> str:
-    """Löscht eine Datei aus dem Projekt."""
+    """Löscht eine Datei aus dem Projekt und räumt leere Verzeichnisse auf."""
     full_path = os.path.join(settings.repo_path, filepath)
     if not os.path.exists(full_path):
         print(f"  ⚠️ Datei nicht gefunden: {filepath}")
         return f"⚠️ Not found: {filepath}"
     os.remove(full_path)
     print(f"  🗑️ Deleted: {filepath}")
+
+    # Leere Verzeichnisse aufräumen (von unten nach oben)
+    dir_path = os.path.dirname(full_path)
+    while dir_path != settings.repo_path and dir_path.startswith(settings.repo_path):
+        if os.path.isdir(dir_path) and not os.listdir(dir_path):
+            os.rmdir(dir_path)
+            rel_dir = os.path.relpath(dir_path, settings.repo_path)
+            print(f"  🗑️ Leeres Verzeichnis entfernt: {rel_dir}")
+            dir_path = os.path.dirname(dir_path)
+        else:
+            break
+
     return f"✅ Deleted: {filepath}"
 
 
@@ -137,8 +159,6 @@ def read_all_files(extensions: list[str] = None) -> dict[str, str]:
     for f in files:
         content = read_file(f)
         if content:
-            # Surrogates entfernen die API-Calls crashen
-            content = content.encode("utf-8", errors="replace").decode("utf-8")
             result[f] = content
     return result
 
@@ -288,3 +308,16 @@ def list_files_tool(directory: str = "") -> str:
     if not files:
         return "Keine Dateien gefunden."
     return "\n".join(sorted(files))
+
+
+@tool
+def delete_file_tool(filepath: str) -> str:
+    """
+    Löscht eine Datei aus dem Projekt.
+    Nutze dies um nicht mehr benötigte Dateien zu entfernen.
+
+    Args:
+        filepath: Relativer Pfad im Projekt
+                  z.B. "app/src/main/kotlin/ch/dv/MobileAndroidTestApp/OldScreen.kt"
+    """
+    return delete_file(filepath)
