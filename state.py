@@ -61,8 +61,9 @@ class AgentState(MessagesState):
     project_analysis: str = ""
     project_initialized: bool = False
 
-    # ── Human-Anweisung ──
+# ── Human-Anweisung ──
     human_instruction: str = ""
+    instruction_images: list[str] = []   # 🆕 Bildpfade aus dem Terminal
 
     # ── Planung ──
     tasks: list[WorkflowTask] = []

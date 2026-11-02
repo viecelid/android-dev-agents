@@ -25,7 +25,7 @@ from tools.github_tools import (
 # 🤖 LLM & Prompt Setup
 # ============================================================
 
-llm = ChatOpenAI(model=settings.default_model, temperature=0)
+llm = ChatOpenAI(model=settings.default_model, streaming=True, temperature=0)
 
 _prompt_path = os.path.join(settings.prompts_dir, "developer_prompt.md")
 _system_prompt = open(_prompt_path, encoding="utf-8").read()

@@ -3,10 +3,14 @@
 import os
 import json
 from pathlib import Path
+
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Confirm
 from langchain_openai import ChatOpenAI
+
 from graph import app
 from state import AgentState
 from config.settings import settings
@@ -15,12 +19,15 @@ from tools.file_tools import (
     read_all_files,
     is_project_initialized,
 )
+from utils.terminal_input import read_instruction
 
 console = Console()
 
 THREAD_ID = "dev-v1"
-MAX_TOTAL_CODE_CHARS = 200000
+RECURSION_LIMIT = 100
+MAX_TOTAL_CODE_CHARS = 200_000
 SESSION_FILE = Path("checkpoints/session.json")
+EXIT_COMMANDS = ("exit", "quit", "q")
 
 
 # ============================================================
@@ -44,6 +51,30 @@ def _save_session(session: dict):
 
 
 # ============================================================
+# 🔧 Graph-Helfer
+# ============================================================
+
+def _thread_config(thread_id: str) -> dict:
+    """Baut die LangGraph-Config für einen Thread."""
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+
+
+def _get_state_values(config: dict) -> dict:
+    """Liest die State-Werte des Checkpoints."""
+    state = app.get_state(config)
+    return getattr(state, "values", None) or {}
+
+
+def _stream_graph(initial_state, config: dict):
+    """Führt den Graph aus und zeigt die Phasen an."""
+    for event in app.stream(initial_state, config, stream_mode="values"):
+        _print_phase(event)
+
+
+# ============================================================
 # 📂 Projekt laden & analysieren
 # ============================================================
 
@@ -52,30 +83,20 @@ def load_project() -> dict:
     Lädt das Projekt-Repo und analysiert den aktuellen Stand.
     Falls leer/nicht vorhanden → signalisiert Scaffold-Bedarf.
     """
+    console.print("\n[bold]📂 Lade Projekt...[/bold]")
+    console.print(f"   Pfad: {escape(settings.repo_path)}")
+    console.print(f"   Repo: {escape(settings.github_repo)}")
 
-    console.print(f"\n[bold]📂 Lade Projekt...[/bold]")
-    console.print(f"   Pfad: {settings.repo_path}")
-    console.print(f"   Repo: {settings.github_repo}")
+    empty = {"files": [], "code_contents": "", "project_initialized": False}
 
-    repo_exists = os.path.exists(settings.repo_path)
-    initialized = is_project_initialized() if repo_exists else False
-
-    if not repo_exists:
-        console.print(f"  🆕 Verzeichnis existiert noch nicht – wird erstellt.")
+    if not os.path.exists(settings.repo_path):
+        console.print("  🆕 Verzeichnis existiert noch nicht – wird erstellt.")
         os.makedirs(settings.repo_path, exist_ok=True)
-        return {
-            "files": [],
-            "code_contents": "",
-            "project_initialized": False,
-        }
+        return empty
 
-    if not initialized:
-        console.print(f"  📂 Verzeichnis existiert, aber kein Projekt erkannt.")
-        return {
-            "files": [],
-            "code_contents": "",
-            "project_initialized": False,
-        }
+    if not is_project_initialized():
+        console.print("  📂 Verzeichnis existiert, aber kein Projekt erkannt.")
+        return empty
 
     # ── Projekt einlesen ──
     files = get_file_tree()
@@ -83,11 +104,11 @@ def load_project() -> dict:
 
     console.print(f"  ✅ Projekt erkannt ({len(files)} Dateien)")
     for f in files[:30]:
-        console.print(f"     • {f}")
+        console.print(f"     • {escape(f)}")
     if len(files) > 30:
         console.print(f"     ... und {len(files) - 30} weitere")
 
-    # Code als String für den Planner
+    # ── Code als String für den Planner ──
     code_str = "\n\n".join(
         f"### {path}\n```{path.split('.')[-1]}\n{code}\n```"
         for path, code in code_contents.items()
@@ -114,37 +135,32 @@ def load_project() -> dict:
 # ============================================================
 
 def _run_initial_analysis(project_data: dict):
-    """
-    Zeigt eine Projekt-Analyse direkt im Terminal an.
-    Wird beim ersten Start aufgerufen – kein Graph-Durchlauf nötig.
-    """
-    console.print(
-        "\n[bold cyan]🔍 Analysiere bestehendes Projekt...[/bold cyan]\n"
-    )
+    """Zeigt eine Projekt-Analyse direkt im Terminal an."""
+    console.print("\n[bold cyan]🔍 Analysiere bestehendes Projekt...[/bold cyan]\n")
 
     llm = ChatOpenAI(model=settings.default_model, temperature=0)
 
-    # Code-Preview für Context (max 30k chars)
-    code_preview = project_data["code_contents"][:30000]
+    code_preview = project_data["code_contents"][:30_000]
     file_list = "\n".join(f"- {f}" for f in project_data["files"])
 
     response = llm.invoke(
-        f"Du bist ein erfahrener Android Software Architect.\n\n"
-        f"Analysiere dieses Projekt und gib eine kompakte Zusammenfassung:\n\n"
-        f"1. **Projekt-Struktur** (Packages, Module, Schichten)\n"
-        f"2. **Features** (Was kann die App bereits?)\n"
-        f"3. **Tech-Stack** (Libraries, Patterns, Architektur)\n"
-        f"4. **Offene Punkte / Verbesserungspotenzial**\n\n"
-        f"Halte dich kurz und präzise. Nutze Markdown-Formatierung.\n\n"
-        f"---\n\n"
+        "Du bist ein erfahrener Android Software Architect.\n\n"
+        "Analysiere dieses Projekt und gib eine kompakte Zusammenfassung:\n\n"
+        "1. **Projekt-Struktur** (Packages, Module, Schichten)\n"
+        "2. **Features** (Was kann die App bereits?)\n"
+        "3. **Tech-Stack** (Libraries, Patterns, Architektur)\n"
+        "4. **Offene Punkte / Verbesserungspotenzial**\n\n"
+        "Halte dich kurz und präzise. Nutze Markdown-Formatierung.\n\n"
+        "---\n\n"
         f"## Projekt: {settings.app_name} ({settings.app_package})\n\n"
         f"### Dateien ({len(project_data['files'])}):\n{file_list}\n\n"
         f"### Code:\n{code_preview}"
     )
 
+    # Markdown statt Rich-Markup → eckige Klammern im LLM-Output crashen nicht
     console.print(Panel(
-        response.content,
-        title=f"🔍 {settings.app_name} – Projekt-Analyse",
+        Markdown(response.content),
+        title=f"🔍 {escape(settings.app_name)} – Projekt-Analyse",
         style="bold cyan",
     ))
 
@@ -153,42 +169,42 @@ def _run_initial_analysis(project_data: dict):
 # 🖨️ UI-Ausgabe
 # ============================================================
 
+PHASE_LABELS = {
+    "plan":                 "🏗️  Planner/Architect",
+    "review_plan":          "👤 Review: Plan",
+    "review_plan_approved": "✅ Plan freigegeben",
+    "review_plan_rejected": "🔄 Plan überarbeiten",
+    "develop":              "💻 Developer",
+    "develop_retry":        "🔄 Developer Retry",
+    "review_dev":           "👤 Review: Code",
+    "review_dev_approved":  "✅ Code freigegeben → Tester",
+    "review_dev_rejected":  "🔄 Code überarbeiten",
+    "test":                 "🧪 Tester",
+    "review_pr":            "👤 Review: Test-Ergebnis / PR",
+    "review_pr_approved":   "✅ PR freigegeben → Commit",
+    "review_pr_rejected":   "🔄 PR überarbeiten",
+    "committed":            "📦 Committed & PR erstellt",
+    "done":                 "🎉 Anweisung abgeschlossen!",
+}
+
+
 def _print_phase(event: dict):
     """Zeigt die aktuelle Phase an."""
     phase = event.get("phase", "")
+    if not phase:
+        return
+
+    label = PHASE_LABELS.get(phase, f"📍 {phase}")
     task = event.get("current_task")
 
-    phase_icons = {
-        "analyze":              "🔍 Projekt-Analyse",
-        "scaffold":             "🏗️  Projekt-Scaffold (Hello World)",
-        "await_instruction":    "⏳ Warte auf Anweisung...",
-        "plan":                 "🏗️  Planner/Architect",
-        "review_plan":          "👤 Review: Plan",
-        "review_plan_approved": "✅ Plan freigegeben",
-        "review_plan_rejected": "🔄 Plan überarbeiten",
-        "develop":              "💻 Developer",
-        "develop_retry":        "🔄 Developer Retry",
-        "review_dev":           "👤 Review: Code",
-        "review_dev_approved":  "✅ Code freigegeben → Tester",
-        "review_dev_rejected":  "🔄 Code überarbeiten",
-        "test":                 "🧪 Tester",
-        "review_pr":            "👤 Review: Test-Ergebnis / PR",
-        "review_pr_approved":   "✅ PR freigegeben → Commit",
-        "review_pr_rejected":   "🔄 PR überarbeiten",
-        "committed":            "📦 Committed & PR erstellt",
-        "done":                 "🎉 Task abgeschlossen!",
-    }
-
-    label = phase_icons.get(phase, f"📍 {phase}")
-
     if task and hasattr(task, "id"):
-        console.print(f"[bold cyan]{label}[/bold cyan] [dim]({task.id})[/dim]")
-    elif phase:
+        console.print(f"[bold cyan]{label}[/bold cyan] [dim]({escape(task.id)})[/dim]")
+    else:
         console.print(f"[bold cyan]{label}[/bold cyan]")
 
 
 def _handle_interrupt():
-    """Behandelt Ctrl+C – Checkpoint wird automatisch gespeichert."""
+    """Behandelt Ctrl+C während ein Task läuft – Checkpoint ist gespeichert."""
     console.print(Panel(
         "⏸️  Entwicklung pausiert (Ctrl+C)\n\n"
         "Checkpoint wurde automatisch gespeichert.\n"
@@ -202,13 +218,13 @@ def _handle_interrupt():
 def _print_completed_tasks(completed: list[dict]):
     """Zeigt alle abgeschlossenen Tasks an."""
     for t in completed:
-        console.print(f"   ✅ {t['id']} – {t['title']}")
-        console.print(f"      PR: [cyan]{t.get('pr_url', '?')}[/cyan]")
+        console.print(f"   ✅ {escape(t.get('id', '?'))} – {escape(t.get('title', '?'))}")
+        console.print(f"      PR: [cyan]{escape(t.get('pr_url', '?'))}[/cyan]")
 
 
 def _print_project_summary(project_data: dict):
     """Zeigt die Projekt-Zusammenfassung an."""
-    console.print(f"\n📊 Projekt-Status:")
+    console.print("\n📊 Projekt-Status:")
     console.print(
         f"   📂 Dateien: {len(project_data['files'])} "
         f"({', '.join(settings.file_extensions)})"
@@ -217,11 +233,11 @@ def _print_project_summary(project_data: dict):
         f"   🏗️  Initialisiert: "
         f"{'Ja' if project_data['project_initialized'] else 'Nein'}"
     )
-    console.print(f"   👤 Du gibst Anweisungen im Terminal")
-    console.print(f"   🏗️  Planner plant Tasks basierend auf deinen Anweisungen")
-    console.print(f"   💻 Developer implementiert nach deinem OK")
-    console.print(f"   🧪 Tester prüft mit `{settings.build_command}`")
-    console.print(f"   📦 Commit erst nach Tester + deinem OK\n")
+    console.print("   👤 Du gibst Anweisungen im Terminal")
+    console.print("   🏗️  Planner plant Tasks basierend auf deinen Anweisungen")
+    console.print("   💻 Developer implementiert nach deinem OK")
+    console.print(f"   🧪 Tester prüft mit `{escape(settings.build_command)}`")
+    console.print("   📦 Commit erst nach Tester + deinem OK\n")
 
 
 # ============================================================
@@ -232,119 +248,96 @@ def _try_resume() -> bool:
     """
     Versucht den letzten aktiven Task fortzusetzen.
     Returns:
-        True  → User will beenden (Ctrl+C oder "Beendet") → run() soll stoppen
-        False → Weiter zur development_loop (nichts zu resumen, oder erfolgreich resumed, oder verworfen)
+        True  → User will beenden → run() soll stoppen
+        False → Weiter zur development_loop
     """
     session = _load_session()
     active_thread = session.get("active_thread")
-
     if not active_thread:
         return False
 
-    # Prüfe den Checkpoint des aktiven Threads
-    resume_config = {
-        "configurable": {"thread_id": active_thread},
-        "recursion_limit": 100,
-    }
+    config = _thread_config(active_thread)
 
-    try:
-        state = app.get_state(resume_config)
-        values = (
-            state.values
-            if hasattr(state, "values")
-            else state.get("values", {})
-        )
-        phase = values.get("phase", "")
-
-        # "done" oder leer = Task war fertig → nichts zu resumen
-        if phase == "done" or phase == "":
-            session["active_thread"] = None
-            _save_session(session)
-            return False
-
-        # ── Offener Task gefunden → Fortsetzen? ──
-        task = values.get("current_task")
-        completed = values.get("completed_tasks", [])
-        retry_count = values.get("retry_count", 0)
-
-        resume_info = (
-            f"🔄 Offener Task gefunden\n\n"
-            f"   Thread: [cyan]{active_thread}[/cyan]\n"
-            f"   Phase: [cyan]{phase}[/cyan]\n"
-        )
-        if task:
-            resume_info += f"   Task: [cyan]{task.id} – {task.title}[/cyan]\n"
-        resume_info += (
-            f"   Branch: [cyan]{values.get('current_branch', '?')}[/cyan]\n"
-            f"   Erledigt: [green]{len(completed)}[/green] Tasks\n"
-            f"   Retries: {retry_count}"
-        )
-
-        console.print(Panel(resume_info, style="bold blue"))
-
-        if Confirm.ask("▶️  Task fortsetzen und fertig machen?"):
-            console.print(
-                "\n[bold green]▶️  Graph wird fortgesetzt...[/bold green]\n"
-            )
-            try:
-                for event in app.stream(None, resume_config, stream_mode="values"):
-                    _print_phase(event)
-            except KeyboardInterrupt:
-                _handle_interrupt()
-                return True  # User will beenden
-
-            # Task fertig → Session aufräumen
-            try:
-                state = app.get_state(resume_config)
-                values = (
-                    state.values
-                    if hasattr(state, "values")
-                    else state.get("values", {})
-                )
-                session["completed_tasks"] = values.get("completed_tasks", completed)
-            except Exception:
-                pass
-
-            session["active_thread"] = None
-            _save_session(session)
-            return False  # Erfolgreich resumed → weiter zur development_loop
-
-        # User will nicht fortfahren → verwerfen oder beenden?
-        if Confirm.ask("🗑️  Task verwerfen und mit neuer Anweisung starten?"):
-            session["active_thread"] = None
-            _save_session(session)
-            return False  # Verworfen → weiter zur development_loop
-
-        console.print("[yellow]👋 Beendet.[/yellow]")
-        return True  # User will komplett beenden
-
-    except Exception:
+    def _clear_active_thread():
         session["active_thread"] = None
         _save_session(session)
+
+    # ── Checkpoint lesen ──
+    try:
+        values = _get_state_values(config)
+    except Exception:
+        _clear_active_thread()
         return False
+
+    phase = values.get("phase", "")
+    if phase in ("", "done"):
+        _clear_active_thread()
+        return False
+
+    # ── Offener Task gefunden ──
+    task = values.get("current_task")
+    completed = values.get("completed_tasks", [])
+
+    resume_info = (
+        "🔄 Offener Task gefunden\n\n"
+        f"   Thread: [cyan]{escape(active_thread)}[/cyan]\n"
+        f"   Phase: [cyan]{escape(phase)}[/cyan]\n"
+    )
+    if task:
+        resume_info += f"   Task: [cyan]{escape(task.id)} – {escape(task.title)}[/cyan]\n"
+    resume_info += (
+        f"   Branch: [cyan]{escape(values.get('current_branch', '') or '?')}[/cyan]\n"
+        f"   Erledigt: [green]{len(completed)}[/green] Tasks\n"
+        f"   Retries: {values.get('retry_count', 0)}"
+    )
+    console.print(Panel(resume_info, style="bold blue"))
+
+    # ── Fortsetzen ──
+    if Confirm.ask("▶️  Task fortsetzen und fertig machen?"):
+        console.print("\n[bold green]▶️  Graph wird fortgesetzt...[/bold green]\n")
+        try:
+            _stream_graph(None, config)
+        except KeyboardInterrupt:
+            _handle_interrupt()
+            return True
+
+        try:
+            values = _get_state_values(config)
+            session["completed_tasks"] = values.get("completed_tasks", completed)
+        except Exception:
+            pass
+
+        _clear_active_thread()
+        return False
+
+    # ── Verwerfen oder beenden ──
+    if Confirm.ask("🗑️  Task verwerfen und mit neuer Anweisung starten?"):
+        _clear_active_thread()
+        return False
+
+    console.print("[yellow]👋 Beendet.[/yellow]")
+    return True
 
 
 # ============================================================
 # 💬 Interaktive Entwicklungsschleife
 # ============================================================
 
-def development_loop(config: dict, project_data: dict):
+def development_loop(project_data: dict):
     """
-    Hauptschleife: Wartet auf Human-Anweisungen, startet den Graph pro Task.
-    Jede Anweisung bekommt eine eigene Thread-ID um Checkpoint-Konflikte zu vermeiden.
+    Hauptschleife: Wartet auf Human-Anweisungen, startet den Graph pro Anweisung.
+    Jede Anweisung bekommt eine eigene Thread-ID (keine Checkpoint-Konflikte).
     """
-
-    # ── Session laden ──
     session = _load_session()
     completed_tasks = session.get("completed_tasks", [])
     task_counter = session.get("task_counter", 0)
 
     # ── Initiale Projekt-Analyse (nur bei bestehendem Projekt) ──
-    if project_data["project_initialized"]:
-        if Confirm.ask("🔍 Projekt-Analyse anzeigen?", default=False):
-            _run_initial_analysis(project_data)
+    if project_data["project_initialized"] and Confirm.ask(
+        "🔍 Projekt-Analyse anzeigen?", default=False
+    ):
+        _run_initial_analysis(project_data)
 
-    # ── Interaktive Loop starten ──
     console.print(Panel(
         "💬 [bold]Entwicklungsmodus aktiv[/bold]\n\n"
         "Gib deine Anweisungen ein (z.B. 'Füge einen Login-Screen hinzu').\n"
@@ -357,20 +350,26 @@ def development_loop(config: dict, project_data: dict):
     ))
 
     while True:
-        # ── Auf Anweisung warten ──
+        # ── Auf Anweisung warten (Ctrl+C / Ctrl+D sauber abfangen) ──
         console.print()
-        instruction = Prompt.ask(
-            "[bold yellow]🎯 Was soll als nächstes gemacht werden?[/bold yellow]"
-        )
+        try:
+            instruction, images = read_instruction(
+                "🎯 Was soll als nächstes gemacht werden?"
+            )
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[yellow]👋 Beendet. Bis zum nächsten Mal![/yellow]")
+            break
 
-        if not instruction.strip():
+        if not instruction:
             continue
 
-        if instruction.strip().lower() in ("exit", "quit", "q"):
+        command = instruction.lower()
+
+        if command in EXIT_COMMANDS:
             console.print("[yellow]👋 Beendet. Bis zum nächsten Mal![/yellow]")
             break
 
-        if instruction.strip().lower() == "status":
+        if command == "status":
             _print_project_summary(project_data)
             if completed_tasks:
                 console.print("  📋 Erledigte Tasks dieser Session:")
@@ -379,22 +378,22 @@ def development_loop(config: dict, project_data: dict):
 
         # ── Neuer Thread pro Anweisung ──
         task_counter += 1
-        task_thread_id = f"{THREAD_ID}-task-{task_counter}"
-        task_config = {
-            "configurable": {"thread_id": task_thread_id},
-            "recursion_limit": 100,
-        }
+        thread_id = f"{THREAD_ID}-task-{task_counter}"
+        config = _thread_config(thread_id)
 
-        # ── Session speichern: aktiver Thread (für Resume bei Crash/Ctrl+C) ──
+        # ── Aktiven Thread speichern (für Resume bei Crash/Ctrl+C) ──
         session["task_counter"] = task_counter
-        session["active_thread"] = task_thread_id
+        session["active_thread"] = thread_id
         session["completed_tasks"] = completed_tasks
         _save_session(session)
 
-        # ── Graph mit Anweisung starten ──
         console.print(
-            f"\n[bold green]🤖 Starte Planung für:[/bold green] {instruction}\n"
+            f"\n[bold green]🤖 Starte Planung für:[/bold green]\n{escape(instruction)}\n"
         )
+        if images:
+            console.print(
+                f"  🖼️ {len(images)} Bild(er) erkannt: {escape(', '.join(images))}"
+            )
 
         initial_state = AgentState(
             messages=[],
@@ -402,39 +401,83 @@ def development_loop(config: dict, project_data: dict):
             code_contents=project_data["code_contents"],
             project_initialized=project_data["project_initialized"],
             human_instruction=instruction,
+            instruction_images=images,
             completed_tasks=completed_tasks,
             tasks=[],
             current_task=None,
         )
 
         try:
-            for event in app.stream(initial_state, task_config, stream_mode="values"):
-                _print_phase(event)
-
-            # ── Nach Task: Projekt neu einlesen ──
-            project_data = load_project()
-
-            # Erledigte Tasks aus State holen
-            try:
-                state = app.get_state(task_config)
-                values = (
-                    state.values
-                    if hasattr(state, "values")
-                    else state.get("values", {})
-                )
-                completed_tasks = values.get("completed_tasks", completed_tasks)
-            except Exception:
-                pass
-
-            # ── Session updaten: Task fertig, kein aktiver Thread mehr ──
-            session["task_counter"] = task_counter
-            session["active_thread"] = None
-            session["completed_tasks"] = completed_tasks
-            _save_session(session)
-
+            _stream_graph(initial_state, config)
         except KeyboardInterrupt:
             _handle_interrupt()
             break
+
+        # ── Nach der Anweisung: Projekt neu einlesen ──
+        project_data = load_project()
+
+        try:
+            completed_tasks = _get_state_values(config).get(
+                "completed_tasks", completed_tasks
+            )
+        except Exception:
+            pass
+
+        # ── Session updaten: kein aktiver Thread mehr ──
+        session["active_thread"] = None
+        session["completed_tasks"] = completed_tasks
+        _save_session(session)
+
+
+# ============================================================
+# 🏗️ Scaffold (neues Projekt)
+# ============================================================
+
+def _run_scaffold() -> bool:
+    """
+    Erstellt ein neues Android-Projekt über den Graph.
+    Returns: True wenn fertig, False wenn abgebrochen (Ctrl+C).
+    """
+    thread_id = f"{THREAD_ID}-scaffold"
+    config = _thread_config(thread_id)
+
+    session = _load_session()
+    session["active_thread"] = thread_id
+    _save_session(session)
+
+    initial_state = AgentState(
+        messages=[],
+        files=[],
+        code_contents="",
+        project_initialized=False,
+        human_instruction=(
+            f"Erstelle ein neues Android-Projekt '{settings.app_name}' "
+            f"mit Package '{settings.app_package}', "
+            f"minSdk={settings.android_min_sdk}, "
+            f"targetSdk={settings.android_target_sdk}, "
+            f"compileSdk={settings.android_compile_sdk}. "
+            f"Verwende Kotlin, Jetpack Compose, Material3. "
+            f"Erstelle eine saubere Projekt-Struktur mit einer "
+            f"einfachen 'Hello World' MainActivity."
+        ),
+        instruction_images=[],
+        completed_tasks=[],
+        tasks=[],
+        current_task=None,
+    )
+
+    console.print("\n[bold green]🤖 Scaffold wird erstellt...[/bold green]\n")
+
+    try:
+        _stream_graph(initial_state, config)
+    except KeyboardInterrupt:
+        _handle_interrupt()
+        return False
+
+    session = _load_session()
+    session["active_thread"] = None
+    _save_session(session)
+    return True
 
 
 # ============================================================
@@ -443,13 +486,12 @@ def development_loop(config: dict, project_data: dict):
 
 def run():
     """Startet oder setzt die Entwicklung fort."""
-
     console.print(Panel(
-        f"🦟 [bold]{settings.app_name} – AI Development Agent[/bold]\n\n"
-        f"Projekt: {settings.repo_path}\n"
-        f"GitHub:  {settings.github_repo}\n"
-        f"Sprache: {settings.language}\n"
-        f"Build:   {settings.build_command}\n\n"
+        f"[bold]{escape(settings.app_name)} – AI Development Agent[/bold]\n\n"
+        f"Projekt: {escape(settings.repo_path)}\n"
+        f"GitHub:  {escape(settings.github_repo)}\n"
+        f"Sprache: {escape(settings.language)}\n"
+        f"Build:   {escape(settings.build_command)}\n\n"
         "Multi-Agent System:\n"
         "  🏗️  Planner/Architect → plant Tasks nach deinen Anweisungen\n"
         "  💻 Developer → implementiert Code\n"
@@ -459,20 +501,14 @@ def run():
         style="bold green",
     ))
 
-    config = {
-        "configurable": {"thread_id": THREAD_ID},
-        "recursion_limit": 100,
-    }
-
-    # ── Resume-Check (sucht aktiven Thread in session.json) ──
-    resumed = _try_resume()
-    if resumed:
-        return  # User will beenden (hat "Beendet" gewählt oder Ctrl+C)
+    # ── Resume-Check ──
+    if _try_resume():
+        return
 
     # ── Projekt laden ──
     project_data = load_project()
 
-    # ── Falls kein Projekt vorhanden → Scaffold anbieten ──
+    # ── Kein Projekt → Scaffold anbieten ──
     if not project_data["project_initialized"]:
         console.print(Panel(
             "🆕 Kein bestehendes Projekt erkannt.\n\n"
@@ -482,67 +518,21 @@ def run():
             style="bold yellow",
         ))
 
-        if Confirm.ask("🏗️  Neues Projekt scaffolden?"):
-            # Eigener Thread für Scaffold
-            scaffold_config = {
-                "configurable": {"thread_id": f"{THREAD_ID}-scaffold"},
-                "recursion_limit": 100,
-            }
-
-            # Session: Scaffold als aktiven Thread markieren
-            session = _load_session()
-            session["active_thread"] = f"{THREAD_ID}-scaffold"
-            _save_session(session)
-
-            # Graph mit Scaffold-Anweisung starten
-            initial_state = AgentState(
-                messages=[],
-                files=[],
-                code_contents="",
-                project_initialized=False,
-                human_instruction=(
-                    f"Erstelle ein neues Android-Projekt '{settings.app_name}' "
-                    f"mit Package '{settings.app_package}', "
-                    f"minSdk={settings.android_min_sdk}, "
-                    f"targetSdk={settings.android_target_sdk}, "
-                    f"compileSdk={settings.android_compile_sdk}. "
-                    f"Verwende Kotlin, Jetpack Compose, Material3. "
-                    f"Erstelle eine saubere Projekt-Struktur mit einer "
-                    f"einfachen 'Hello World' MainActivity."
-                ),
-                completed_tasks=[],
-                tasks=[],
-                current_task=None,
-            )
-
-            console.print("\n[bold green]🤖 Scaffold wird erstellt...[/bold green]\n")
-
-            try:
-                for event in app.stream(initial_state, scaffold_config, stream_mode="values"):
-                    _print_phase(event)
-            except KeyboardInterrupt:
-                _handle_interrupt()
-                return
-
-            # Scaffold fertig → Session aufräumen
-            session = _load_session()
-            session["active_thread"] = None
-            _save_session(session)
-
-            # Projekt neu laden nach Scaffold
-            project_data = load_project()
-        else:
+        if not Confirm.ask("🏗️  Neues Projekt scaffolden?"):
             console.print(
-                f"[yellow]Lege ein Projekt in {settings.repo_path} ab "
+                f"[yellow]Lege ein Projekt in {escape(settings.repo_path)} ab "
                 f"und starte neu.[/yellow]"
             )
             return
 
-    # ── Projekt-Zusammenfassung ──
-    _print_project_summary(project_data)
+        if not _run_scaffold():
+            return
 
-    # ── Interaktive Entwicklungsschleife starten ──
-    development_loop(config, project_data)
+        project_data = load_project()
+
+    # ── Los geht's ──
+    _print_project_summary(project_data)
+    development_loop(project_data)
 
 
 # ============================================================
@@ -550,4 +540,8 @@ def run():
 # ============================================================
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except (KeyboardInterrupt, EOFError):
+        # Fängt Ctrl+C/Ctrl+D überall sonst ab (z.B. bei Confirm.ask oder im Review)
+        console.print("\n[yellow]👋 Abgebrochen. Checkpoint bleibt erhalten.[/yellow]")

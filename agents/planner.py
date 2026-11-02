@@ -4,7 +4,8 @@ import os
 import time
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from utils.terminal_input import image_to_content_block
 from pydantic import BaseModel, field_validator
 from config.settings import settings
 from state import WorkflowTask, PlannerDecision
@@ -15,11 +16,12 @@ from tools.github_tools import create_task_workflow
 # 🤖 LLM & Prompt Setup
 # ============================================================
 
-llm = ChatOpenAI(model=settings.default_model, temperature=0)
+llm = ChatOpenAI(model=settings.default_model, streaming=True, temperature=0,max_tokens=32000)
 
 _prompt_path = os.path.join(settings.prompts_dir, "planner_prompt.md")
-_system_prompt = open(_prompt_path, encoding="utf-8").read()
-_system_prompt = _system_prompt.replace("{", "{{").replace("}", "}}")
+_raw_system_prompt = open(_prompt_path, encoding="utf-8").read()            # 🆕
+_system_prompt = _raw_system_prompt.replace("{", "{{").replace("}", "}}")
+
 
 planner_prompt = ChatPromptTemplate.from_messages([
     ("system", _system_prompt),
@@ -103,7 +105,7 @@ class PlannerOutput(BaseModel):
 
 
 planner_chain = planner_prompt | llm.with_structured_output(PlannerOutput)
-
+structured_llm = llm.with_structured_output(PlannerOutput) 
 
 # ============================================================
 # 📏 Hilfsfunktionen
@@ -260,7 +262,18 @@ def run_planner(state: dict) -> dict:
     result = None
     for attempt in range(1, max_attempts + 1):
         try:
-            result = planner_chain.invoke({"context": context})
+            images = state.get("instruction_images", [])
+            if images:
+                print(f"  🖼️ Sende {len(images)} Bild(er) an das LLM...")
+                human_content = [{"type": "text", "text": context}] + [
+                    image_to_content_block(p) for p in images
+                ]
+                result = structured_llm.invoke([
+                    SystemMessage(content=_raw_system_prompt),
+                    HumanMessage(content=human_content),
+                ])
+            else:
+                result = planner_chain.invoke({"context": context})
             break
         except Exception as e:
             print(f"  ⚠️ LLM-Aufruf fehlgeschlagen (Versuch {attempt}/{max_attempts}): {type(e).__name__}")
@@ -302,6 +315,29 @@ def run_planner(state: dict) -> dict:
             branch_name=f"feature/{task_id}",
         )
         all_workflow_tasks.append(wf_task)
+
+    # ── Keine Tasks geplant → sauber beenden ──
+    if not all_workflow_tasks:
+        print("\n" + "=" * 60)
+        print("✅  PLANNER: Keine Tasks nötig – nichts zu tun.")
+        if result.analysis:
+            print(f"\n📝 Analyse:\n   {result.analysis}")
+        print("=" * 60)
+        return {
+            "messages": [AIMessage(content=(
+                "✅ Keine Tasks nötig.\n" + (result.analysis or "")
+            ))],
+            "project_analysis": result.analysis,
+            "tasks": [],
+            "current_task": None,
+            "human_feedback": "",
+            "feedback_target": "",
+            "phase": "done",
+        }
+
+    # Erster Task wird current_task
+    first_task = all_workflow_tasks[0]
+
 
     # Erster Task wird current_task
     first_task = all_workflow_tasks[0]

@@ -137,8 +137,7 @@ _PATH_RE = re.compile(
 def extract_images(text: str) -> tuple[list[str], list[str]]:
     """
     Gibt (gefundene_bilder, fehlende_pfade) zurück.
-    Robust gegen eingefügten Code, Logs und Stacktraces:
-    Nicht-Bildpfade werden übersprungen, Fehler werden abgefangen.
+    Robust gegen eingefügten Code, Logs und Stacktraces.
     """
     found, missing = [], []
 
@@ -163,7 +162,7 @@ def extract_images(text: str) -> tuple[list[str], list[str]]:
         # 3️⃣ Existiert die Datei im Container?
         try:
             exists = p.is_file()
-        except OSError:          # z. B. Name zu lang
+        except OSError:
             exists = False
 
         if exists:
@@ -200,7 +199,7 @@ def read_instruction(question: str = "🎯 Was soll als nächstes gemacht werden
 
     try:
         images, missing = extract_images(text)
-    except Exception as e:                       # Sicherheitsnetz: Eingabe nie verlieren
+    except Exception as e:
         console.print(f"[yellow]⚠️  Bilderkennung übersprungen: {escape(str(e))}[/yellow]")
         images, missing = [], []
 

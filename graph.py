@@ -1,6 +1,7 @@
 # graph.py
 
 import sqlite3
+from utils.terminal_input import read_instruction
 from pathlib import Path
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -146,11 +147,10 @@ def tester_node(state: dict) -> dict:
 # ============================================================
 
 def _normalize_input(raw: str) -> str:
-    """Normalisiert Terminal-Input – entfernt unsichtbare Zeichen."""
-    cleaned = raw.strip()
-    cleaned = "".join(c for c in cleaned if c.isprintable() or c == " ")
-    cleaned = cleaned.strip()
-    return cleaned
+    """Entfernt unsichtbare Zeichen, behält aber Zeilenumbrüche."""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = "".join(c for c in raw if c.isprintable() or c in "\n\t")
+    return cleaned.strip()
 
 
 def human_review(state: dict) -> dict:
@@ -192,7 +192,7 @@ def human_review(state: dict) -> dict:
 
     # ── Input holen ──
     print(f"\n{'─' * 40}")
-    raw_input = input("👤 Dein Review (ok / Feedback): ")
+    raw_input, _images = read_instruction("👤 Dein Review (ok / Feedback):")
     feedback = _normalize_input(raw_input)
     print(f"{'─' * 40}")
     print(f"  [Input erkannt: '{feedback}']")
