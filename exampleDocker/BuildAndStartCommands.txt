@@ -1,0 +1,32 @@
+#run this command outside of the agent folder 
+docker build --platform linux/amd64 -t android-dev -f android-dev-agents/exampleDocker/DockerImageAndroidDevAgents .
+
+
+
+docker run -it --platform linux/amd64 \
+  -v /Users/tzhvida2/StudioProjects/android-dev-agents:/app/android-dev-agents \
+  -v /Users/tzhvida2/StudioProjects/MobileAndroidTestApp:/app/MobileAndroidTestApp \
+  -v ~/.config/gh:/root/.config/gh:ro \
+  -v ~/agent-inbox:/inbox \
+  -v /Users/tzhvida2/Downloads:/Users/tzhvida2/Downloads:ro \
+  --env-file /Users/tzhvida2/StudioProjects/android-dev-agents/.env.docker \
+  -w /app/android-dev-agents \
+  android-dev \
+  bash -c '
+    export GIT_CONFIG_GLOBAL=/tmp/.gitconfig
+    git config --global url."https://${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+    git config --global user.name "viecelid"
+    git config --global user.email “Viecelidario@gmail.com”
+    
+    # Gradle Wrapper sicherstellen (Version 8.13 für AGP 8.13.2)
+    if [ ! -f "${REPO_PATH}/gradlew" ]; then
+      echo "🔧 Generiere Gradle Wrapper..."
+      (cd "${REPO_PATH}" && gradle wrapper --gradle-version 8.13)
+    fi
+    chmod +x "${REPO_PATH}/gradlew" 2>/dev/null
+
+    exec bash'
+
+
+
+******************Dies ist reine Doku*****************

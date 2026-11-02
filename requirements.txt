@@ -17,3 +17,7 @@ httpx
 # UI
 rich
 langgraph-checkpoint-sqlite
+
+#Tools
+prompt_toolkit
+pillow
